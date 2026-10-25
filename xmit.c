@@ -609,6 +609,18 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		    ht_prot == IEEE80211_HT_OP_MODE_PROTECTION_NONHT_MIXED)
 			rates[0].flags |= IEEE80211_TX_RC_USE_RTS_CTS;
 	}
+	/* As brcmsmac does, protect an HT PPDU when any retry stage asks for
+	 * RTS/CTS. minstrel_ht asks on its fallback stages, so every A-MPDU
+	 * starts with an RTS; unprotected A-MPDUs raise the PSM watchdog more
+	 * often.
+	 */
+	if (ht && protect && ack) {
+		int i;
+
+		for (i = 1; i < IEEE80211_TX_MAX_RATES && rates[i].idx >= 0; i++)
+			if (rates[i].flags & IEEE80211_TX_RC_USE_RTS_CTS)
+				rates[0].flags |= IEEE80211_TX_RC_USE_RTS_CTS;
+	}
 	/* MAC control */
 	if (!(info->flags & IEEE80211_TX_CTL_NO_ACK))
 		mac_ctl |= B43_TXH_MAC_ACK;
