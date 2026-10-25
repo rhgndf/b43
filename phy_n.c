@@ -4854,8 +4854,8 @@ static void b43_nphy_tx_cal_radio_setup(struct b43_wldev *dev)
 		save[3] = b43_radio_read(dev, B2055_C2_TX_RF_IQCAL2);
 		b43_radio_write(dev, B2055_C2_TX_RF_IQCAL2, 0x54);
 
-		save[3] = b43_radio_read(dev, B2055_C1_PWRDET_RXTX);
-		save[4] = b43_radio_read(dev, B2055_C2_PWRDET_RXTX);
+		save[4] = b43_radio_read(dev, B2055_C1_PWRDET_RXTX);
+		save[5] = b43_radio_read(dev, B2055_C2_PWRDET_RXTX);
 
 		if (!(b43_phy_read(dev, B43_NPHY_BANDCTL) &
 		    B43_NPHY_BANDCTL_5GHZ)) {
