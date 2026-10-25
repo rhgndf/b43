@@ -3833,7 +3833,8 @@ static void b43_nphy_tx_power_fix(struct b43_wldev *dev)
 				B43_NPHY_PAPD_EN0 : B43_NPHY_PAPD_EN1;
 			tmp32 = b43_ntab_read(dev, B43_NTAB32(26 + i,
 							      576 + txpi[i]));
-			b43_phy_maskset(dev, reg, 0xE00F, (u32) tmp32 << 4);
+			b43_phy_maskset(dev, reg, 0xE00F,
+					((u32) tmp32 << 4) & 0x1FF0);
 			b43_phy_set(dev, reg, 0x4);
 		}
 	}
