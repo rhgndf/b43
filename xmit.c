@@ -749,7 +749,8 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 	if (unlikely(rate_idx == -1)) {
 		/* PLCP seems to be corrupted.
 		 * Drop the frame, if we are not interested in corrupted frames. */
-		if (!(dev->wl->filter_flags & FIF_PLCPFAIL))
+		if (!(dev->wl->filter_flags & FIF_PLCPFAIL) ||
+		    !(status.flag & RX_FLAG_FAILED_PLCP_CRC))
 			goto drop;
 	}
 	status.rate_idx = rate_idx;
