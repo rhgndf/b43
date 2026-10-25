@@ -752,9 +752,10 @@ static void b43_set_slot_time(struct b43_wldev *dev, u16 slot_time)
 	 * set to slot_time; however, this register is initially 0 and changing
 	 * the value adversely affects the transmit rate for BCM4311
 	 * devices. Until this behavior is unterstood, delete this step
-	 *
-	 * b43_shm_write16(dev, B43_SHM_SHARED, 0x0010, slot_time);
 	 */
+	/* Write it on the BCM43227, as brcmsmac does. */
+	if (dev->ht)
+		b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_SLOTT, slot_time);
 }
 
 static void b43_short_slot_timing_enable(struct b43_wldev *dev)
