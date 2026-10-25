@@ -5738,7 +5738,7 @@ static int b43_nphy_rev2_cal_rx_iq(struct b43_wldev *dev,
 						real = est.i1_pwr;
 						imag = est.q1_pwr;
 					}
-					power[i] = ((real + imag) / 1024) + 1;
+					power[j] = ((real + imag) / 1024) + 1;
 				} else {
 					b43_nphy_calc_rx_iq_comp(dev, 1 << i);
 				}
