@@ -9,8 +9,8 @@
 #define B43_PPR_MCS_RATES_NUM		8
 
 #define B43_PPR_RATES_NUM	(B43_PPR_CCK_RATES_NUM +	\
-				 B43_PPR_OFDM_RATES_NUM * 2 +	\
-				 B43_PPR_MCS_RATES_NUM * 4)
+				 B43_PPR_OFDM_RATES_NUM * 4 +	\
+				 B43_PPR_MCS_RATES_NUM * 8 + 1)
 
 struct b43_ppr_rates {
 	u8 cck[B43_PPR_CCK_RATES_NUM];
@@ -20,7 +20,19 @@ struct b43_ppr_rates {
 	u8 mcs_20_cdd[B43_PPR_MCS_RATES_NUM];
 	u8 mcs_20_stbc[B43_PPR_MCS_RATES_NUM];
 	u8 mcs_20_sdm[B43_PPR_MCS_RATES_NUM];
+	u8 ofdm_40[B43_PPR_OFDM_RATES_NUM];
+	u8 ofdm_40_cdd[B43_PPR_OFDM_RATES_NUM];
+	u8 mcs_40[B43_PPR_MCS_RATES_NUM]; /* SISO */
+	u8 mcs_40_cdd[B43_PPR_MCS_RATES_NUM];
+	u8 mcs_40_stbc[B43_PPR_MCS_RATES_NUM];
+	u8 mcs_40_sdm[B43_PPR_MCS_RATES_NUM];
+	u8 mcs_32;
 };
+
+/* The OFDM and MCS rates, 40 MHz without MCS 32 */
+#define B43_PPR_20_FIRST	offsetof(struct b43_ppr_rates, ofdm)
+#define B43_PPR_40_FIRST	offsetof(struct b43_ppr_rates, ofdm_40)
+#define B43_PPR_40_END		offsetof(struct b43_ppr_rates, mcs_32)
 
 struct b43_ppr {
 	/* All powers are in qdbm (Q5.2) */

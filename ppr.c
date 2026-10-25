@@ -65,6 +65,16 @@ u8 b43_ppr_get_max(struct b43_wldev *dev, struct b43_ppr *ppr)
 	return res;
 }
 
+/* OFDM 6 and 9 Mbit/s take MCS 0's power, 12-54 Mbit/s MCS 1-6's */
+static void b43_ppr_mcs_to_ofdm(u8 *ofdm, const u8 *mcs)
+{
+	int i;
+
+	ofdm[0] = mcs[0];
+	for (i = 1; i < B43_PPR_OFDM_RATES_NUM; i++)
+		ofdm[i] = mcs[i - 1];
+}
+
 bool b43_ppr_load_max_from_sprom(struct b43_wldev *dev, struct b43_ppr *ppr,
 				 enum b43_band band)
 {
@@ -74,7 +84,7 @@ bool b43_ppr_load_max_from_sprom(struct b43_wldev *dev, struct b43_ppr *ppr,
 	u8 maxpwr, off;
 	u32 sprom_ofdm_po;
 	u16 *sprom_mcs_po;
-	u8 extra_cdd_po, extra_stbc_po;
+	u8 extra_cdd_po, extra_stbc_po, extra_bw40_po;
 	int i;
 
 	switch (band) {
@@ -85,6 +95,7 @@ bool b43_ppr_load_max_from_sprom(struct b43_wldev *dev, struct b43_ppr *ppr,
 		sprom_mcs_po = sprom->mcs2gpo;
 		extra_cdd_po = (sprom->cddpo >> 0) & 0xf;
 		extra_stbc_po = (sprom->stbcpo >> 0) & 0xf;
+		extra_bw40_po = (sprom->bw40po >> 0) & 0xf;
 		break;
 	case B43_BAND_5G_LO:
 		maxpwr = min(sprom->core_pwr_info[0].maxpwr_5gl,
@@ -93,6 +104,7 @@ bool b43_ppr_load_max_from_sprom(struct b43_wldev *dev, struct b43_ppr *ppr,
 		sprom_mcs_po = sprom->mcs5glpo;
 		extra_cdd_po = (sprom->cddpo >> 8) & 0xf;
 		extra_stbc_po = (sprom->stbcpo >> 8) & 0xf;
+		extra_bw40_po = (sprom->bw40po >> 8) & 0xf;
 		break;
 	case B43_BAND_5G_MI:
 		maxpwr = min(sprom->core_pwr_info[0].maxpwr_5g,
@@ -101,6 +113,7 @@ bool b43_ppr_load_max_from_sprom(struct b43_wldev *dev, struct b43_ppr *ppr,
 		sprom_mcs_po = sprom->mcs5gpo;
 		extra_cdd_po = (sprom->cddpo >> 4) & 0xf;
 		extra_stbc_po = (sprom->stbcpo >> 4) & 0xf;
+		extra_bw40_po = (sprom->bw40po >> 4) & 0xf;
 		break;
 	case B43_BAND_5G_HI:
 		maxpwr = min(sprom->core_pwr_info[0].maxpwr_5gh,
@@ -109,6 +122,7 @@ bool b43_ppr_load_max_from_sprom(struct b43_wldev *dev, struct b43_ppr *ppr,
 		sprom_mcs_po = sprom->mcs5ghpo;
 		extra_cdd_po = (sprom->cddpo >> 12) & 0xf;
 		extra_stbc_po = (sprom->stbcpo >> 12) & 0xf;
+		extra_bw40_po = (sprom->bw40po >> 12) & 0xf;
 		break;
 	default:
 		WARN_ON_ONCE(1);
@@ -185,6 +199,34 @@ bool b43_ppr_load_max_from_sprom(struct b43_wldev *dev, struct b43_ppr *ppr,
 		off = ((sprom_mcs_po[3] >> (i * 4)) & 0xf) * 2;
 		rates->mcs_20_sdm[4 + i] = maxpwr - off;
 	}
+
+	/* 40 MHz, as brcmsmac wlc_phy_txpwr_apply_nphy() does it: N-PHY
+	 * rev 5+ has separate MCS offsets for 40 MHz (SISO, CDD and STBC
+	 * from words 4 and 5, SDM from words 6 and 7), older PHYs take the
+	 * 20 MHz powers.
+	 */
+	if (phy->type == B43_PHYTYPE_N && phy->rev >= 5) {
+		for (i = 0; i < 8; i++) {
+			off = ((sprom_mcs_po[4 + i / 4] >> (i % 4 * 4)) & 0xf) * 2;
+			rates->mcs_40[i] = maxpwr - off;
+			rates->mcs_40_cdd[i] = maxpwr - off - extra_cdd_po;
+			rates->mcs_40_stbc[i] = maxpwr - off - extra_stbc_po;
+
+			off = ((sprom_mcs_po[6 + i / 4] >> (i % 4 * 4)) & 0xf) * 2;
+			rates->mcs_40_sdm[i] = maxpwr - off;
+		}
+		b43_ppr_mcs_to_ofdm(rates->ofdm_40, rates->mcs_40);
+		b43_ppr_mcs_to_ofdm(rates->ofdm_40_cdd, rates->mcs_40_cdd);
+	} else {
+		/* The 40 MHz rates are laid out as the 20 MHz ones */
+		memcpy(&ppr->__all_rates[B43_PPR_40_FIRST],
+		       &ppr->__all_rates[B43_PPR_20_FIRST],
+		       B43_PPR_40_END - B43_PPR_40_FIRST);
+	}
+	if (phy->type == B43_PHYTYPE_N && phy->rev >= 3)
+		for (i = B43_PPR_40_FIRST; i < B43_PPR_40_END; i++)
+			ppr->__all_rates[i] -= extra_bw40_po * 2;
+	rates->mcs_32 = rates->mcs_40_cdd[0];
 
 	return true;
 }

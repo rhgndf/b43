@@ -5916,7 +5916,8 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 	if (phy->rev >= 3) {
 		/* brcmsmac wlc_phy_txpower_recalc_target() backs SROM limits off
 		 * by 1.5 dB. Its 2.4 GHz locale (channel.c, locale_bn) limits
-		 * 20 MHz SISO MCS to 16 dBm and two-chain MCS to 13 dBm.
+		 * SISO MCS to 16 dBm and two-chain MCS to 13 dBm, and at 40 MHz
+		 * OFDM to the MCS limits.
 		 */
 		for (i = 0; i < B43_PPR_MCS_RATES_NUM; i++) {
 			ppr->rates.mcs_20[i] = min_t(u8, ppr->rates.mcs_20[i],
@@ -5927,7 +5928,20 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 							  INT_TO_Q52(13));
 			ppr->rates.mcs_20_sdm[i] = min_t(u8, ppr->rates.mcs_20_sdm[i],
 							 INT_TO_Q52(13));
+			ppr->rates.ofdm_40[i] = min_t(u8, ppr->rates.ofdm_40[i],
+						      INT_TO_Q52(16));
+			ppr->rates.ofdm_40_cdd[i] = min_t(u8, ppr->rates.ofdm_40_cdd[i],
+							  INT_TO_Q52(13));
+			ppr->rates.mcs_40[i] = min_t(u8, ppr->rates.mcs_40[i],
+						     INT_TO_Q52(16));
+			ppr->rates.mcs_40_cdd[i] = min_t(u8, ppr->rates.mcs_40_cdd[i],
+							 INT_TO_Q52(13));
+			ppr->rates.mcs_40_stbc[i] = min_t(u8, ppr->rates.mcs_40_stbc[i],
+							  INT_TO_Q52(13));
+			ppr->rates.mcs_40_sdm[i] = min_t(u8, ppr->rates.mcs_40_sdm[i],
+							 INT_TO_Q52(13));
 		}
+		ppr->rates.mcs_32 = min_t(u8, ppr->rates.mcs_32, INT_TO_Q52(13));
 		b43_ppr_add(dev, ppr, -6);
 	}
 
@@ -5957,9 +5971,8 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 	/* Hardware power control targets the highest rate power; each rate's
 	 * adjusted-power-table entry is its offset below that (brcmsmac
 	 * wlc_phy_txpower_recalc_target()). The PPR entries are in the same
-	 * order as the 20 MHz brcmsmac TXP_* rate indices; brcmsmac drives
-	 * rev3+ only.
-	 */
+	 * order as the brcmsmac TXP_* rate indices; brcmsmac drives rev3+
+	 * only. */
 	max = b43_ppr_get_max(dev, ppr);
 	for (i = 0; phy->rev >= 3 && i < B43_PPR_RATES_NUM; i++)
 		nphy->tx_power_offset[i] = max - ppr->__all_rates[i];
