@@ -4905,6 +4905,108 @@ static void b43_wireless_core_exit(struct b43_wldev *dev)
 	b43_bus_may_powerdown(dev);
 }
 
+static bool b43_tx_fifo_set(struct b43_wldev *dev,
+			    const u16 definition[6][2], const u16 sizes[4],
+			    u16 selector, u32 shm_control)
+{
+	bool valid = true;
+	int i;
+
+	for (i = 0; i < 6; i++) {
+		u16 command = 0x8000 | (i << 8);
+
+		b43_write16(dev, B43_MMIO_XMTFIFOCMD, command);
+		b43_write16(dev, B43_MMIO_XMTFIFODEF, definition[i][0]);
+		b43_write16(dev, B43_MMIO_XMTFIFODEF1, definition[i][1]);
+		b43_write16(dev, B43_MMIO_XMTFIFOCMD, command);
+	}
+	for (i = 0; i < 4; i++)
+		b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_SIZE01 + 2 * i,
+				sizes[i]);
+	for (i = 0; i < 6; i++) {
+		b43_write16(dev, B43_MMIO_XMTFIFOCMD, i << 8);
+		valid &= b43_read16(dev, B43_MMIO_XMTFIFOCMD) == (i << 8);
+		valid &= b43_read16(dev, B43_MMIO_XMTFIFODEF) == definition[i][0];
+		valid &= b43_read16(dev, B43_MMIO_XMTFIFODEF1) == definition[i][1];
+	}
+	for (i = 0; i < 4; i++)
+		valid &= b43_shm_read16(dev, B43_SHM_SHARED,
+					B43_SHM_SH_SIZE01 + 2 * i) == sizes[i];
+	b43_write16(dev, B43_MMIO_XMTFIFOCMD, selector);
+	b43_write32(dev, B43_MMIO_SHM_CONTROL, shm_control);
+	valid &= b43_read16(dev, B43_MMIO_XMTFIFOCMD) == selector;
+	valid &= b43_read32(dev, B43_MMIO_SHM_CONTROL) == shm_control;
+	valid &= !(b43_read32(dev, B43_MMIO_MACCTL) & B43_MACCTL_ENABLED);
+
+	return valid;
+}
+
+static int b43_tx_fifo_init(struct b43_wldev *dev)
+{
+	/* 256-byte blocks starting at block 6,
+	 * BK/BE/VI/VO/BCMC/ATIM = 9/98/22/14/14/5 */
+	static const u16 definition[6][2] = {
+		{ 0x0e06, 0 }, { 0x700f, 0 }, { 0x8671, 0 },
+		{ 0x9487, 0 }, { 0xa295, 0 }, { 0xa7a3, 0 },
+	};
+	/* BE, VI, (VO << 8) | BK, (ATIM << 8) | BCMC */
+	static const u16 sizes[4] = { 98, 22, 0x0e09, 0x050e };
+	u16 old_definition[6][2], old_sizes[4], selector;
+	u32 shm_control;
+	bool valid = true;
+	int i;
+
+	if (!dev->ht || dev->dev->bus_type != B43_BUS_BCMA || dev->use_pio)
+		return 0;
+
+	lockdep_assert_held(&dev->wl->mutex);
+	/* Run only during core initialization, before allocating DMA rings.
+	 * tx_work cannot submit before STARTED and holds this same mutex. */
+	if (b43_status(dev) != B43_STAT_UNINIT || !dev->mac_suspended ||
+	    (b43_read32(dev, B43_MMIO_MACCTL) & B43_MACCTL_ENABLED))
+		return -EBUSY;
+	for (i = 0; i < 6; i++) {
+		u16 base = B43_MMIO_DMA64_BASE0 + 0x40 * i;
+		u32 control = b43_read32(dev, base + B43_DMA64_TXCTL);
+		u32 status = b43_read32(dev, base + B43_DMA64_TXSTATUS);
+		u32 error = b43_read32(dev, base + B43_DMA64_TXERROR);
+
+		if ((control & B43_DMA64_TXENABLE) ||
+		    (status & B43_DMA64_TXSTAT) != B43_DMA64_TXSTAT_DISABLED)
+			return -EBUSY;
+		if (error & B43_DMA64_TXERR)
+			return -EIO;
+	}
+	selector = b43_read16(dev, B43_MMIO_XMTFIFOCMD);
+	if ((selector & ~0x0700) || selector > 0x0500)
+		return -EIO;
+	shm_control = b43_read32(dev, B43_MMIO_SHM_CONTROL);
+	for (i = 0; i < 6; i++) {
+		b43_write16(dev, B43_MMIO_XMTFIFOCMD, i << 8);
+		valid &= b43_read16(dev, B43_MMIO_XMTFIFOCMD) == (i << 8);
+		old_definition[i][0] = b43_read16(dev, B43_MMIO_XMTFIFODEF);
+		old_definition[i][1] = b43_read16(dev, B43_MMIO_XMTFIFODEF1);
+	}
+	for (i = 0; i < 4; i++)
+		old_sizes[i] = b43_shm_read16(dev, B43_SHM_SHARED,
+					      B43_SHM_SH_SIZE01 + 2 * i);
+	b43_write16(dev, B43_MMIO_XMTFIFOCMD, selector);
+	b43_write32(dev, B43_MMIO_SHM_CONTROL, shm_control);
+	if (!valid)
+		return -EIO;
+
+	if (b43_tx_fifo_set(dev, definition, sizes, selector, shm_control))
+		return 0;
+	if (b43_read32(dev, B43_MMIO_MACCTL) & B43_MACCTL_ENABLED) {
+		b43err(dev->wl, "Cannot restore TX FIFOs with MAC enabled\n");
+		return -EIO;
+	}
+	if (!b43_tx_fifo_set(dev, old_definition, old_sizes,
+			     selector, shm_control))
+		b43err(dev->wl, "TX FIFO restoration failed\n");
+	return -EIO;
+}
+
 /* Initialize a wireless core */
 static int b43_wireless_core_init(struct b43_wldev *dev)
 {
@@ -5016,6 +5118,12 @@ static int b43_wireless_core_init(struct b43_wldev *dev)
 	/* write phytype and phyvers */
 	b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_PHYTYPE, phy->type);
 	b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_PHYVER, phy->rev);
+
+	err = b43_tx_fifo_init(dev);
+	if (err) {
+		b43err(dev->wl, "Cannot initialize the TX FIFOs (%d)\n", err);
+		goto err_chip_exit;
+	}
 
 	if (b43_bus_host_is_pcmcia(dev->dev) ||
 	    b43_bus_host_is_sdio(dev->dev)) {
