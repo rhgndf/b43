@@ -1531,7 +1531,8 @@ static u16 b43_nphy_gen_load_samples(struct b43_wldev *dev, u32 freq, u16 max,
 					bool test)
 {
 	int i;
-	u16 bw, len, rot, angle;
+	u16 bw, len;
+	s32 rot, angle;
 	struct cordic_iq *samples;
 
 	bw = b43_is_40mhz(dev) ? 40 : 20;
@@ -1558,8 +1559,10 @@ static u16 b43_nphy_gen_load_samples(struct b43_wldev *dev, u32 freq, u16 max,
 	angle = 0;
 
 	for (i = 0; i < len; i++) {
-		samples[i] = cordic_calc_iq(CORDIC_FIXED(angle));
+		samples[i] = cordic_calc_iq(CORDIC_FLOAT(angle));
 		angle += rot;
+		if (angle >= CORDIC_FIXED(360))
+			angle -= CORDIC_FIXED(360);
 		samples[i].q = CORDIC_FLOAT(samples[i].q * max);
 		samples[i].i = CORDIC_FLOAT(samples[i].i * max);
 	}
