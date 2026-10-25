@@ -4485,7 +4485,7 @@ static void b43_nphy_calc_rx_iq_comp(struct b43_wldev *dev, u8 mask)
 	u32 qq;
 	int iq_nbits, qq_nbits;
 	int arsh, brsh;
-	u16 tmp, a, b;
+	s32 tmp, a, b;
 
 	struct nphy_iq_est est;
 	struct b43_phy_n_iq_comp old;
