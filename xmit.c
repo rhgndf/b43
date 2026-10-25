@@ -329,6 +329,8 @@ static u16 b43_generate_tx_phy_ctl1(struct b43_wldev *dev, u8 bitrate, bool ht,
 		if (bitrate >= 8)
 			control |= B43_TXH_PHY1_MODE_SDM |
 				   (1 << B43_TXH_PHY1_NSS_SHIFT);
+		else if (hweight8(dev->txchain) == 1)
+			control |= B43_TXH_PHY1_MODE_SISO;
 		else
 			control |= B43_TXH_PHY1_MODE_CDD;
 	} else if (b43_is_cck_rate(bitrate) && phy->type != B43_PHYTYPE_LP) {
@@ -639,6 +641,11 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		break;
 	default:
 		B43_WARN_ON(1);
+	}
+	/* On the BCM43227 the field holds the mask of TX cores. */
+	if (dev->ht) {
+		phy_ctl &= ~B43_TXH_PHY_ANT;
+		phy_ctl |= dev->txchain << B43_TXH_PHY_ANT_SHIFT;
 	}
 
 	rates = info->control.rates;
@@ -1278,10 +1285,18 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 			status.signal = max(rxhdr->power1, rxhdr->power2);
 		else
 			status.signal = max(rxhdr->power0, rxhdr->power1);
-		/* The BCM43227 receives on both cores, core 0 first. Frames
-		 * without PHY status carry no power. */
-		if (dev->ht && (macstat & B43_RX_MAC_RXST_VALID)) {
-			status.chains = 0x3;
+		if (!dev->ht)
+			break;
+		/* On the BCM43227, power0 is core 0's and power1 core 1's. A
+		 * core that does not receive reads 116.
+		 */
+		if (dev->rxchain == 0x1)
+			status.signal = rxhdr->power0;
+		else if (dev->rxchain == 0x2)
+			status.signal = rxhdr->power1;
+		/* Frames without PHY status carry no power. */
+		if (macstat & B43_RX_MAC_RXST_VALID) {
+			status.chains = dev->rxchain;
 			status.chain_signal[0] = rxhdr->power0;
 			status.chain_signal[1] = rxhdr->power1;
 		}

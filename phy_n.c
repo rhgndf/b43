@@ -7443,8 +7443,8 @@ static int b43_nphy_cal_admit(struct b43_wldev *dev)
  * suspended and TX power control off. Returns 1 if the PHY was busy and the
  * calibration was skipped.
  */
-static int b43_nphy_cal_run(struct b43_wldev *dev,
-			    enum b43_nphy_cal_phase phase)
+static int b43_nphy_cal_run_engines(struct b43_wldev *dev,
+				    enum b43_nphy_cal_phase phase)
 {
 	struct b43_nphy_calibration *cal = dev->phy.n->calibration;
 	bool all = phase == B43_NPHY_CAL_ALL;
@@ -7496,6 +7496,23 @@ static int b43_nphy_cal_run(struct b43_wldev *dev,
 	cal->valid = true;
 	cal->stage = "complete";
 	return 0;
+}
+
+/* A core's TX calibrations measure through its own receiver, so turn on
+ * both RX cores meanwhile.
+ */
+static int b43_nphy_cal_run(struct b43_wldev *dev,
+			    enum b43_nphy_cal_phase phase)
+{
+	u8 rxchain = dev->phy.n->phyrxchain;
+	int err;
+
+	if (rxchain != 3)
+		b43_nphy_set_rx_core_state(dev, 3);
+	err = b43_nphy_cal_run_engines(dev, phase);
+	if (rxchain != 3)
+		b43_nphy_set_rx_core_state(dev, rxchain);
+	return err;
 }
 
 static bool b43_nphy_cal_qualified(struct b43_wldev *dev)
@@ -8228,7 +8245,8 @@ static void b43_nphy_op_prepare_structs(struct b43_wldev *dev)
 				B43_SPUR_AVOID_AUTO : B43_SPUR_AVOID_DISABLE;
 	nphy->gain_boost = true; /* this way we follow wl, assume it is true */
 	nphy->txrx_chain = 2; /* sth different than 0 and 1 for now */
-	nphy->phyrxchain = 3; /* to avoid b43_nphy_set_rx_core_state like wl */
+	/* Both RX cores, unless set_antenna chose one */
+	nphy->phyrxchain = dev->ht ? dev->rxchain : 3;
 	nphy->perical = 2; /* avoid additional rssi cal on init (like wl) */
 	/* 128 can mean disabled-by-default state of TX pwr ctl. Max value is
 	 * 0x7f == 127 and we check for 128 when restoring TX pwr ctl. */

@@ -858,6 +858,9 @@ struct b43_wldev {
 	/* HT support */
 	bool ht;
 	struct ieee80211_supported_band band_2ghz_ht;
+	/* HT TX and RX core masks; core init applies them. */
+	u8 txchain;
+	u8 rxchain;
 	/* Channel of the N-PHY noise round in progress. */
 	unsigned int noise_channel;
 	/* HT receive rate context, protected by wl->mutex. */

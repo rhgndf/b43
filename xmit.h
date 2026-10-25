@@ -152,6 +152,7 @@ struct b43_tx_legacy_rate_phy_ctl_entry {
 #define  B43_TXH_PHY_ENC_VHT		0x0003 /* VHT */
 #define B43_TXH_PHY_SHORTPRMBL		0x0010 /* Use short preamble */
 #define B43_TXH_PHY_ANT			0x03C0 /* Antenna selection */
+#define B43_TXH_PHY_ANT_SHIFT		6
 #define  B43_TXH_PHY_ANT0		0x0000 /* Use antenna 0 */
 #define  B43_TXH_PHY_ANT1		0x0040 /* Use antenna 1 */
 #define  B43_TXH_PHY_ANT01AUTO		0x00C0 /* Use antenna 0/1 auto */
