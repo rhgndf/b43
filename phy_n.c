@@ -2987,6 +2987,9 @@ static void b43_nphy_workarounds_rev7plus(struct b43_wldev *dev)
 				       rx2tx_lut_40_11n[core]);
 			b43_ntab_write(dev, B43_NTAB16(7, 0x159 + core * 16),
 				       rx2tx_lut_40_11n[core]);
+			if (phy->radio_rev == 9 && !b43_is_40mhz(dev))
+				b43_ntab_write(dev, B43_NTAB16(7, 0x158 + core * 16),
+					       rx2tx_lut_20_11b[core]);
 		}
 	}
 
