@@ -5843,6 +5843,7 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 	struct ieee80211_channel *channel = dev->wl->hw->conf.chandef.chan;
 	struct b43_ppr *ppr = &nphy->tx_pwr_max_ppr;
 	u8 max; /* qdBm */
+	int i;
 
 	if (nphy->tx_pwr_last_recalc_freq == channel->center_freq &&
 	    nphy->tx_pwr_last_recalc_limit == phy->desired_txpower)
@@ -5853,6 +5854,23 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 
 	/* HW limitations */
 	b43_ppr_load_max_from_sprom(dev, ppr, B43_BAND_2G);
+	if (phy->rev >= 3) {
+		/* brcmsmac wlc_phy_txpower_recalc_target() backs SROM limits off
+		 * by 1.5 dB. Its 2.4 GHz locale (channel.c, locale_bn) limits
+		 * 20 MHz SISO MCS to 16 dBm and two-chain MCS to 13 dBm.
+		 */
+		b43_ppr_add(dev, ppr, -6);
+		for (i = 0; i < B43_PPR_MCS_RATES_NUM; i++) {
+			ppr->rates.mcs_20[i] = min_t(u8, ppr->rates.mcs_20[i],
+						     INT_TO_Q52(16));
+			ppr->rates.mcs_20_cdd[i] = min_t(u8, ppr->rates.mcs_20_cdd[i],
+							 INT_TO_Q52(13));
+			ppr->rates.mcs_20_stbc[i] = min_t(u8, ppr->rates.mcs_20_stbc[i],
+							  INT_TO_Q52(13));
+			ppr->rates.mcs_20_sdm[i] = min_t(u8, ppr->rates.mcs_20_sdm[i],
+							 INT_TO_Q52(13));
+		}
+	}
 
 	/* Regulatory & user settings */
 	max = INT_TO_Q52(phy->chandef->chan->max_power);
@@ -5876,6 +5894,16 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 
 	/* Make sure we didn't go too low */
 	b43_ppr_apply_min(dev, ppr, INT_TO_Q52(8));
+
+	/* Hardware power control targets the highest rate power; each rate's
+	 * adjusted-power-table entry is its offset below that (brcmsmac
+	 * wlc_phy_txpower_recalc_target()). The PPR entries are in the same
+	 * order as the 20 MHz brcmsmac TXP_* rate indices; brcmsmac drives
+	 * rev3+ only.
+	 */
+	max = b43_ppr_get_max(dev, ppr);
+	for (i = 0; phy->rev >= 3 && i < B43_PPR_RATES_NUM; i++)
+		nphy->tx_power_offset[i] = max - ppr->__all_rates[i];
 
 	/* Apply */
 	b43_mac_suspend(dev);
