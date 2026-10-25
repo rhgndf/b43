@@ -238,6 +238,7 @@ enum {
 
 /* Misc SHM_SHARED offsets */
 #define B43_SHM_SH_WLCOREREV		0x0016	/* 802.11 core revision */
+#define B43_SHM_SH_MAXRXFRMLEN		0x0020	/* Longest frame received, PLCP header included */
 #define B43_SHM_SH_PCTLWDPOS		0x0008
 #define B43_SHM_SH_RXPADOFF		0x0034	/* RX Padding data offset (PIO only) */
 #define B43_SHM_SH_WATCHDOG_8TU		0x003C	/* MIMO receive watchdog */

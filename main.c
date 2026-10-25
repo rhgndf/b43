@@ -5350,6 +5350,12 @@ static int b43_wireless_core_init(struct b43_wldev *dev)
 	}
 	if (err)
 		goto err_chip_exit;
+	/* The microcode drops longer frames, by default those over 2352
+	 * bytes: a QoS data frame with CCMP and a 2304-byte MSDU is longer.
+	 * DMA receives them into several buffers. */
+	if (dev->ht && !b43_using_pio_transfers(dev))
+		b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_MAXRXFRMLEN,
+				B43_DMA_RX_MAX_FRAME_LEN);
 	ieee80211_iterate_stations_atomic(dev->wl->hw,
 					  b43_ampdu_tx_restart_sta, dev);
 	b43_qos_init(dev);
