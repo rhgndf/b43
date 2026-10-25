@@ -369,6 +369,23 @@ static void b43_op_bss_info_changed(struct ieee80211_hw *hw,
 				    struct ieee80211_bss_conf *conf,
 				    u64 changed);
 
+/* mac80211 reports the channel and global limit in conf.power_level, and
+ * the interface's user and AP (power constraint) limit in bss_conf.txpower. */
+static void b43_update_txpower(struct b43_wldev *dev)
+{
+	struct b43_wl *wl = dev->wl;
+	int power = wl->hw->conf.power_level;
+
+	if (wl->vif && wl->vif->bss_conf.txpower > 0)
+		power = power ? min(power, wl->vif->bss_conf.txpower) :
+				wl->vif->bss_conf.txpower;
+	if (power && power != dev->phy.desired_txpower) {
+		dev->phy.desired_txpower = power;
+		b43_phy_txpower_check(dev, B43_TXPWR_IGNORE_TIME |
+					   B43_TXPWR_IGNORE_TSSI);
+	}
+}
+
 static int b43_ratelimit(struct b43_wl *wl)
 {
 	if (!wl || !wl->current_dev)
@@ -4024,13 +4041,7 @@ static int b43_op_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 	dev->wl->radiotap_enabled = !!(conf->flags & IEEE80211_CONF_MONITOR);
 
 	/* Adjust the desired TX power level. */
-	if (conf->power_level != 0) {
-		if (conf->power_level != phy->desired_txpower) {
-			phy->desired_txpower = conf->power_level;
-			b43_phy_txpower_check(dev, B43_TXPWR_IGNORE_TIME |
-						   B43_TXPWR_IGNORE_TSSI);
-		}
-	}
+	b43_update_txpower(dev);
 
 	/* Antennas for RX and management frame TX. */
 	antenna = B43_ANTENNA_DEFAULT;
@@ -4139,6 +4150,9 @@ static void b43_op_bss_info_changed(struct ieee80211_hw *hw,
 		if (changed & BSS_CHANGED_BSSID)
 			b43_write_mac_bssid_templates(dev);
 	}
+
+	if (changed & BSS_CHANGED_TXPOWER)
+		b43_update_txpower(dev);
 
 	b43_mac_suspend(dev);
 
