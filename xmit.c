@@ -249,6 +249,7 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	struct ieee80211_rate *fbrate;
 	u8 rate, rate_fb;
 	int rate_ofdm, rate_fb_ofdm;
+	bool short_preamble_fb;
 	unsigned int plcp_fragment_len;
 	u32 mac_ctl = 0;
 	u16 phy_ctl = 0;
@@ -267,6 +268,9 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	fbrate = ieee80211_get_alt_retry_rate(dev->wl->hw, info, 0) ? : txrate;
 	rate_fb = fbrate ? fbrate->hw_value : rate;
 	rate_fb_ofdm = b43_is_ofdm_rate(rate_fb);
+	short_preamble_fb = !rate_fb_ofdm && rate_fb != B43_CCK_RATE_1MB &&
+		(info->control.rates[info->control.rates[1].idx < 0 ? 0 : 1].flags &
+		 IEEE80211_TX_RC_USE_SHORT_PREAMBLE);
 
 	if (rate_ofdm)
 		txhdr->phy_rate = b43_plcp_get_ratecode_ofdm(rate);
@@ -406,6 +410,8 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		mac_ctl |= B43_TXH_MAC_STMSDU;
 	if (!phy->gmode)
 		mac_ctl |= B43_TXH_MAC_5GHZ;
+	if (short_preamble_fb)
+		mac_ctl |= B43_TXH_MAC_FB_SHORTPRMBL;
 
 	/* Overwrite rates[0].count to make the retry calculation
 	 * in the tx status easier. need the actual retry limit to
