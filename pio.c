@@ -649,6 +649,7 @@ static bool pio_rx_frame(struct b43_pio_rxqueue *q)
 		}
 	}
 	b43dbg(q->dev->wl, "PIO RX timed out\n");
+	dev->rx_ht_valid = false;
 	return true;
 data_ready:
 
@@ -683,7 +684,7 @@ data_ready:
 		break;
 	}
 	if (macstat & B43_RX_MAC_FCSERR) {
-		if (!(q->dev->wl->filter_flags & FIF_FCSFAIL)) {
+		if (!(q->dev->wl->filter_flags & FIF_FCSFAIL) && !q->dev->ht) {
 			/* Drop frames with failed FCS. */
 			err_msg = "Frame FCS error";
 			goto rx_error;
@@ -749,6 +750,7 @@ data_ready:
 	return true;
 
 rx_error:
+	dev->rx_ht_valid = false;
 	if (err_msg)
 		b43dbg(q->dev->wl, "PIO RX error: %s\n", err_msg);
 	if (q->rev >= 8)

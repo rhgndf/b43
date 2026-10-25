@@ -240,6 +240,7 @@ enum {
 #define B43_SHM_SH_WLCOREREV		0x0016	/* 802.11 core revision */
 #define B43_SHM_SH_PCTLWDPOS		0x0008
 #define B43_SHM_SH_RXPADOFF		0x0034	/* RX Padding data offset (PIO only) */
+#define B43_SHM_SH_WATCHDOG_8TU		0x003C	/* MIMO receive watchdog */
 #define B43_SHM_SH_FWCAPA		0x0042	/* Firmware capabilities (Opensource firmware only) */
 #define B43_SHM_SH_PHYVER		0x0050	/* PHY version */
 #define B43_SHM_SH_PHYTYPE		0x0052	/* PHY type */
@@ -255,6 +256,7 @@ enum {
 #define B43_SHM_SH_CHAN			0x00A0	/* Current channel (low 8bit only) */
 #define  B43_SHM_SH_CHAN_5GHZ		0x0100	/* Bit set, if 5 Ghz channel */
 #define  B43_SHM_SH_CHAN_40MHZ		0x0200	/* Bit set, if 40 Mhz channel width */
+#define B43_SHM_SH_MIMO_MAXSYM		0x00BA	/* MIMO receive limit */
 #define B43_SHM_SH_MACHW_L		0x00C0	/* Location where the ucode expects the MAC capabilities */
 #define B43_SHM_SH_MACHW_H		0x00C2	/* Location where the ucode expects the MAC capabilities */
 #define B43_SHM_SH_HOSTF5		0x00D4	/* Hostflags 5 for ucode options */
@@ -288,6 +290,9 @@ enum {
 #define B43_SHM_SH_SLOTT		0x0010	/* Slot time */
 #define B43_SHM_SH_DTIMPER		0x0012	/* DTIM period */
 #define B43_SHM_SH_NOSLPZNATDTIM	0x004C	/* NOSLPZNAT DTIM */
+/* Template RAM */
+#define B43_RAM_BA_TA			0x0048	/* Block Ack transmitter address */
+
 /* SHM_SHARED beacon/AP variables */
 #define B43_SHM_SH_BT_BASE0		0x0068	/* Beacon template base 0 */
 #define B43_SHM_SH_BTL0			0x0018	/* Beacon template length 0 */
@@ -846,6 +851,12 @@ struct b43_wldev {
 	/* HT support */
 	bool ht;
 	struct ieee80211_supported_band band_2ghz_ht;
+	/* HT receive rate context, protected by wl->mutex. */
+	u64 rx_ht_deadline;
+	u32 rx_ht_tsf;
+	u16 rx_ht_channel;
+	u8 rx_ht_plcp[6];
+	bool rx_ht_valid;
 
 	/* PHY/Radio device. */
 	struct b43_phy phy;

@@ -676,6 +676,7 @@ static void b43_tsf_write_locked(struct b43_wldev *dev, u64 tsf)
 
 void b43_tsf_write(struct b43_wldev *dev, u64 tsf)
 {
+	dev->rx_ht_valid = false;
 	b43_time_lock(dev);
 	b43_tsf_write_locked(dev, tsf);
 	b43_time_unlock(dev);
@@ -727,6 +728,10 @@ static void b43_write_mac_bssid_templates(struct b43_wldev *dev)
 		tmp |= (u32) (mac_bssid[i + 2]) << 16;
 		tmp |= (u32) (mac_bssid[i + 3]) << 24;
 		b43_ram_write(dev, 0x20 + i, tmp);
+	}
+	if (dev->ht) {
+		b43_ram_write(dev, B43_RAM_BA_TA, get_unaligned_le32(mac));
+		b43_ram_write(dev, B43_RAM_BA_TA + 4, get_unaligned_le16(mac + 4));
 	}
 }
 
@@ -3160,7 +3165,7 @@ static void b43_adjust_opmode(struct b43_wldev *dev)
 
 	if (wl->filter_flags & FIF_CONTROL)
 		ctl |= B43_MACCTL_KEEP_CTL;
-	if (wl->filter_flags & FIF_FCSFAIL)
+	if ((wl->filter_flags & FIF_FCSFAIL) || dev->ht)
 		ctl |= B43_MACCTL_KEEP_BAD;
 	if (wl->filter_flags & FIF_PLCPFAIL)
 		ctl |= B43_MACCTL_KEEP_BADPLCP;
@@ -3341,6 +3346,12 @@ static int b43_chip_init(struct b43_wldev *dev)
 	/* Probe Response Timeout value */
 	/* FIXME: Default to 0, has to be set by ioctl probably... :-/ */
 	b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_PRMAXTIME, 0);
+	if (dev->ht) {
+		b43_shm_write16(dev, B43_SHM_SHARED,
+				B43_SHM_SH_MIMO_MAXSYM, 0xFFFF);
+		b43_shm_write16(dev, B43_SHM_SHARED,
+				B43_SHM_SH_WATCHDOG_8TU, 10);
+	}
 
 	/* Initially set the wireless operation mode. */
 	b43_adjust_opmode(dev);
@@ -4451,6 +4462,7 @@ redo:
 	}
 	mask = b43_read32(dev, B43_MMIO_GEN_IRQ_MASK);
 	B43_WARN_ON(mask != 0xFFFFFFFF && mask);
+	dev->rx_ht_valid = false;
 
 	/* Drain all TX queues. */
 	for (queue_num = 0; queue_num < B43_QOS_QUEUE_NUM; queue_num++) {
@@ -4749,6 +4761,7 @@ static void setup_struct_phy_for_init(struct b43_wldev *dev,
 static void setup_struct_wldev_for_init(struct b43_wldev *dev)
 {
 	dev->dfq_valid = false;
+	dev->rx_ht_valid = false;
 
 	/* Assume the radio is enabled. If it's not enabled, the state will
 	 * immediately get fixed on the first periodic work run. */
@@ -5209,6 +5222,40 @@ static void b43_op_sta_notify(struct ieee80211_hw *hw,
 	B43_WARN_ON(!vif || wl->vif != vif);
 }
 
+static int b43_op_ampdu_action(struct ieee80211_hw *hw,
+			       struct ieee80211_vif *vif,
+			       struct ieee80211_ampdu_params *params)
+{
+	struct b43_wl *wl = hw_to_b43_wl(hw);
+	struct b43_wldev *dev;
+	int err = -EOPNOTSUPP;
+
+	switch (params->action) {
+	case IEEE80211_AMPDU_RX_START:
+		mutex_lock(&wl->mutex);
+		dev = wl->current_dev;
+		if (dev && b43_status(dev) >= B43_STAT_STARTED &&
+		    vif == wl->vif && (vif->type == NL80211_IFTYPE_STATION ||
+				       vif->type == NL80211_IFTYPE_AP ||
+				       vif->type == NL80211_IFTYPE_ADHOC))
+			err = 0;
+		mutex_unlock(&wl->mutex);
+		return err;
+	case IEEE80211_AMPDU_RX_STOP:
+		/* Nothing to stop: the microcode sends the Block Acks. */
+		return 0;
+	case IEEE80211_AMPDU_TX_STOP_CONT:
+		ieee80211_stop_tx_ba_cb_irqsafe(vif, params->sta->addr, params->tid);
+		return 0;
+	case IEEE80211_AMPDU_TX_STOP_FLUSH:
+	case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
+		/* No TX aggregation session or aggregate descriptors are accepted. */
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static void b43_op_sw_scan_start_notifier(struct ieee80211_hw *hw,
 					  struct ieee80211_vif *vif,
 					  const u8 *mac_addr)
@@ -5319,6 +5366,7 @@ static const struct ieee80211_ops b43_hw_ops = {
 	.stop			= b43_op_stop,
 	.set_tim		= b43_op_beacon_set_tim,
 	.sta_notify		= b43_op_sta_notify,
+	.ampdu_action		= b43_op_ampdu_action,
 	.sw_scan_start		= b43_op_sw_scan_start_notifier,
 	.sw_scan_complete	= b43_op_sw_scan_complete_notifier,
 	.flush			= b43_op_flush,
@@ -5421,11 +5469,14 @@ static int b43_setup_bands(struct b43_wldev *dev,
 		ht = &dev->band_2ghz_ht.ht_cap;
 		ht->ht_supported = true;
 		ht->cap = IEEE80211_HT_CAP_SM_PS; /* Both RX chains stay awake. */
+		ht->ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K;
+		ht->ampdu_density = IEEE80211_HT_MPDU_DENSITY_4;
 		ht->mcs.rx_mask[0] = 0xff;
 		ht->mcs.rx_mask[1] = 0xff;
 		ht->mcs.rx_highest = cpu_to_le16(130);
 		ht->mcs.tx_params = IEEE80211_HT_MCS_TX_DEFINED;
-		/* No AMPDU_AGGREGATION flag or BA-session callback. */
+		ieee80211_hw_set(hw, AMPDU_AGGREGATION);
+		hw->max_rx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF_HT;
 		hw->wiphy->bands[NL80211_BAND_2GHZ] = &dev->band_2ghz_ht;
 	}
 
@@ -5962,6 +6013,7 @@ static int __init b43_init(void)
 {
 	int err;
 
+	b43_ht_sig_crc_init();
 	b43_debugfs_init();
 	err = b43_sdio_init();
 	if (err)

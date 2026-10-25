@@ -1607,8 +1607,10 @@ static void dma_rx_multi(struct b43_dmaring *ring, int *slot, u16 len)
 			break;
 		*slot = next_slot(ring, *slot);
 	}
-	if (unlikely(!skb))
+	if (unlikely(!skb)) {
+		ring->dev->rx_ht_valid = false;
 		return;
+	}
 	rxhdr = (struct b43_rxhdr_fw4 *)skb->data;
 	skb_pull(skb, ring->frameoffset);
 	b43_rx(ring->dev, skb, rxhdr);
@@ -1678,6 +1680,7 @@ static void dma_rx(struct b43_dmaring *ring, int *slot)
 	return;
 
 drop_recycle_buffer:
+	ring->dev->rx_ht_valid = false;
 	/* Poison and recycle the RX buffer. */
 	b43_poison_rx_buffer(ring, skb);
 	sync_descbuffer_for_device(ring, dmaaddr, ring->rx_buffersize);
@@ -1687,6 +1690,7 @@ void b43_dma_handle_rx_overflow(struct b43_dmaring *ring)
 {
 	int current_slot, previous_slot;
 
+	ring->dev->rx_ht_valid = false;
 	B43_WARN_ON(ring->tx);
 
 	/* Device has filled all buffers, drop all packets and let TCP

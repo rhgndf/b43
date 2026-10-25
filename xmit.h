@@ -355,6 +355,7 @@ u8 b43_plcp_get_ratecode_ofdm(const u8 bitrate);
 void b43_generate_plcp_hdr(struct b43_plcp_hdr4 *plcp,
 			   const u16 octets, const u8 bitrate, bool ht);
 
+void b43_ht_sig_crc_init(void);
 void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr);
 
 void b43_handle_txstatus(struct b43_wldev *dev,

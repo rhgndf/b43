@@ -6,6 +6,7 @@ config B43
 	select SSB if B43_SSB
 	select FW_LOADER
 	select CORDIC
+	select CRC8
 	help
 	  b43 is a driver for the Broadcom 43xx series wireless devices.
 

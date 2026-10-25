@@ -38,6 +38,9 @@
 #include "phy_common.h"
 #include "dma.h"
 #include "pio.h"
+#include <linux/crc8.h>
+#include <linux/ktime.h>
+#include <linux/unaligned.h>
 
 static const struct b43_tx_legacy_rate_phy_ctl_entry b43_tx_legacy_rate_phy_ctl[] = {
 	{ B43_CCK_RATE_1MB,	0x0,			0x0 },
@@ -875,10 +878,76 @@ static s8 b43_rssi_postprocess(struct b43_wldev *dev,
 	return (s8) tmp;
 }
 
+/* x^8 + x^2 + x + 1, bit-reversed */
+#define B43_HT_SIG_CRC_POLY	0xe0
+
+DECLARE_CRC8_TABLE(b43_ht_sig_crc_table);
+
+void b43_ht_sig_crc_init(void)
+{
+	crc8_populate_lsb(b43_ht_sig_crc_table, B43_HT_SIG_CRC_POLY);
+}
+
+/* HT-SIG: 34 data bits, complemented CRC-8, then six zero tail bits */
+static bool b43_ht_sig_crc_valid(const u8 *plcp)
+{
+	u8 crc = crc8(b43_ht_sig_crc_table, plcp, 4, CRC8_INIT_VALUE);
+	int i;
+
+	crc ^= plcp[4] & 3;
+	for (i = 0; i < 2; i++)
+		crc = (crc >> 1) ^ ((crc & 1) ? B43_HT_SIG_CRC_POLY : 0);
+	return (u8)~crc == ((plcp[4] >> 2) | (plcp[5] << 6));
+}
+
+static const u8 *b43_rx_ht_plcp(struct b43_wldev *dev, const u8 *plcp,
+			       u32 macstat, u16 mactime, u16 channel)
+{
+	u64 now;
+	u32 tsf;
+
+	if (get_unaligned_le32(plcp) || get_unaligned_le16(plcp + 4)) {
+		dev->rx_ht_valid = false;
+		if ((plcp[0] & 0x7f) > 15)
+			return NULL;
+		if (!(macstat & B43_RX_MAC_RXST_VALID) &&
+		    !b43_ht_sig_crc_valid(plcp))
+			return NULL;
+		if ((plcp[3] & 0x08) && !(macstat & B43_RX_MAC_RXST_VALID)) {
+			now = ktime_get_ns();
+			tsf = b43_read32(dev, B43_MMIO_REV3PLUS_TSF_LOW);
+			memcpy(dev->rx_ht_plcp, plcp, sizeof(dev->rx_ht_plcp));
+			dev->rx_ht_tsf = tsf - (u16)(tsf - mactime);
+			dev->rx_ht_channel = channel;
+			dev->rx_ht_deadline = now + 64 * NSEC_PER_MSEC;
+			dev->rx_ht_valid = true;
+		}
+		return plcp;
+	}
+
+	if (!dev->rx_ht_valid || (u16)dev->rx_ht_tsf != mactime ||
+	    dev->rx_ht_channel != channel ||
+	    ktime_get_ns() >= dev->rx_ht_deadline)
+		goto invalid;
+	/* Resolve the TSF epoch too: equal low 16 bits can belong to a later
+	 * PPDU even when an older first member was processed only recently. */
+	tsf = b43_read32(dev, B43_MMIO_REV3PLUS_TSF_LOW);
+	if (tsf - (u16)(tsf - mactime) != dev->rx_ht_tsf)
+		goto invalid;
+	if (macstat & B43_RX_MAC_RXST_VALID)
+		dev->rx_ht_valid = false;
+	return dev->rx_ht_plcp;
+
+invalid:
+	dev->rx_ht_valid = false;
+	return NULL;
+}
+
 void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 {
 	struct ieee80211_rx_status status;
 	struct b43_plcp_hdr6 *plcp;
+	const u8 *ht_plcp = NULL;
 	struct ieee80211_hdr *wlhdr;
 	const struct b43_rxhdr_fw4 *rxhdr = _rxhdr;
 	__le16 fctl;
@@ -912,6 +981,8 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 	if (dev->ht &&
 	    (phystat0 & B43_RX_PHYST0_FTYPE) == B43_RX_PHYST0_STD_N)
 		goto drop;
+	if (dev->ht && !(phystat0 & B43_RX_PHYST0_PRE_N))
+		dev->rx_ht_valid = false;
 
 	if (unlikely(macstat & B43_RX_MAC_FCSERR)) {
 		dev->wl->ieee_stats.dot11FCSErrorCount++;
@@ -921,6 +992,16 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 		status.flag |= RX_FLAG_FAILED_PLCP_CRC;
 	if (phystat0 & B43_RX_PHYST0_SHORTPRMBL)
 		status.enc_flags |= RX_ENC_FLAG_SHORTPRE;
+	if (dev->ht && (phystat0 & B43_RX_PHYST0_PRE_N)) {
+		if (!(macstat & B43_RX_MAC_RXST_VALID))
+			status.flag &= ~RX_FLAG_FAILED_PLCP_CRC;
+		padding = (macstat & B43_RX_MAC_PADDING) ? 2 : 0;
+		if (dev->fw.hdr_format == B43_FW_HDR_598 &&
+		    !(status.flag & RX_FLAG_FAILED_PLCP_CRC) &&
+		    skb->len >= sizeof(struct b43_plcp_hdr6) + padding)
+			ht_plcp = b43_rx_ht_plcp(dev, skb->data + padding,
+						macstat, mactime, chanstat);
+	}
 	if (macstat & B43_RX_MAC_DECERR) {
 		/* Decryption with the given key failed.
 		 * Drop the packet. We also won't be able to decrypt it with
@@ -996,21 +1077,20 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 	if (dev->ht && (phystat0 & B43_RX_PHYST0_PRE_N)) {
 		/* Type 2 is HT on N-PHY, not a legacy CCK rate code. A
 		 * failed HT-SIG cannot provide trustworthy MCS metadata. */
-		if (dev->fw.hdr_format != B43_FW_HDR_598 ||
-		    (status.flag & RX_FLAG_FAILED_PLCP_CRC))
+		if (!ht_plcp)
 			goto drop;
-		rate_idx = plcp->raw[0] & 0x7f;
-		if (rate_idx > 15)
-			goto drop;
+		rate_idx = ht_plcp[0] & 0x7f;
+		if (!(macstat & B43_RX_MAC_RXST_VALID))
+			status.flag |= RX_FLAG_NO_SIGNAL_VAL;
 		status.encoding = RX_ENC_HT;
 		status.enc_flags &= ~RX_ENC_FLAG_SHORTPRE;
-		status.bw = (plcp->raw[0] & 0x80) ?
+		status.bw = (ht_plcp[0] & 0x80) ?
 			RATE_INFO_BW_40 : RATE_INFO_BW_20;
-		if (plcp->raw[3] & 0x80)
+		if (ht_plcp[3] & 0x80)
 			status.enc_flags |= RX_ENC_FLAG_SHORT_GI;
-		if (plcp->raw[3] & 0x40)
+		if (ht_plcp[3] & 0x40)
 			status.enc_flags |= RX_ENC_FLAG_LDPC;
-		status.enc_flags |= ((plcp->raw[3] >> 4) & 3) <<
+		status.enc_flags |= ((ht_plcp[3] >> 4) & 3) <<
 				    RX_ENC_FLAG_STBC_SHIFT;
 	} else if (phystat0 & B43_RX_PHYST0_OFDM)
 		rate_idx = b43_plcp_get_bitrate_idx_ofdm(plcp,
@@ -1084,6 +1164,8 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 #endif
 	return;
 drop:
+	if (!ht_plcp)
+		dev->rx_ht_valid = false;
 	dev_kfree_skb_any(skb);
 }
 

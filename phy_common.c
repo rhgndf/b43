@@ -419,6 +419,8 @@ int b43_switch_channel(struct b43_wldev *dev, unsigned int new_channel)
 	u16 channelcookie, savedcookie;
 	int err;
 
+	dev->rx_ht_valid = false;
+
 	/* First we set the channel radio code to prevent the
 	 * firmware from sending ghost packets.
 	 */
