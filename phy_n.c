@@ -4523,10 +4523,10 @@ static void b43_nphy_calc_rx_iq_comp(struct b43_wldev *dev, u8 mask)
 
 		arsh = iq_nbits - 20;
 		if (arsh >= 0) {
-			a = -((iq << (30 - iq_nbits)) + (ii >> (1 + arsh)));
+			a = -(iq << (30 - iq_nbits)) + (ii >> (1 + arsh));
 			tmp = ii >> arsh;
 		} else {
-			a = -((iq << (30 - iq_nbits)) + (ii << (-1 - arsh)));
+			a = -(iq << (30 - iq_nbits)) + (ii << (-1 - arsh));
 			tmp = ii << -arsh;
 		}
 		if (tmp == 0) {
