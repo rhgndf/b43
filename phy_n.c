@@ -5859,7 +5859,6 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 		 * by 1.5 dB. Its 2.4 GHz locale (channel.c, locale_bn) limits
 		 * 20 MHz SISO MCS to 16 dBm and two-chain MCS to 13 dBm.
 		 */
-		b43_ppr_add(dev, ppr, -6);
 		for (i = 0; i < B43_PPR_MCS_RATES_NUM; i++) {
 			ppr->rates.mcs_20[i] = min_t(u8, ppr->rates.mcs_20[i],
 						     INT_TO_Q52(16));
@@ -5870,6 +5869,7 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 			ppr->rates.mcs_20_sdm[i] = min_t(u8, ppr->rates.mcs_20_sdm[i],
 							 INT_TO_Q52(13));
 		}
+		b43_ppr_add(dev, ppr, -6);
 	}
 
 	/* Regulatory & user settings */
