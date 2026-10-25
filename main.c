@@ -3402,6 +3402,15 @@ static int b43_chip_init(struct b43_wldev *dev)
 		b43_shm_write16(dev, B43_SHM_SHARED,
 				B43_SHM_SH_WATCHDOG_8TU, 10);
 	}
+	/* Enable energy-detect carrier sense in IFSCTL1 and in the copy that
+	 * the firmware restores it from. Firmware 784.2 uploads slower with it.
+	 */
+	if (dev->dev->core_rev == 30 && dev->fw.rev >= 832) {
+		value16 = b43_shm_read16(dev, B43_SHM_SHARED, B43_SHM_SH_IFSCTL1);
+		b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_IFSCTL1,
+				value16 | B43_MMIO_IFSCTL1_EDCRS);
+		b43_maskset16(dev, B43_MMIO_IFSCTL1, ~0, B43_MMIO_IFSCTL1_EDCRS);
+	}
 
 	/* Initially set the wireless operation mode. */
 	b43_adjust_opmode(dev);
