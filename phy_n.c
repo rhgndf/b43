@@ -3341,10 +3341,6 @@ static void b43_nphy_workarounds_rev3plus(struct b43_wldev *dev)
 	b43_phy_write(dev, B43_NPHY_ED_CRS20UASSERTTHRESH1, 0x042b);
 	b43_phy_write(dev, B43_NPHY_ED_CRS20UDEASSERTTHRESH0, 0x0381);
 	b43_phy_write(dev, B43_NPHY_ED_CRS20UDEASSERTTHRESH1, 0x0381);
-
-	if (dev->phy.rev >= 6 && sprom->boardflags2_lo & B43_BFL2_SINGLEANT_CCK) {
-		; /* TODO: 0x0080000000000000 HF */
-	}
 }
 
 static void b43_nphy_workarounds_rev1_2(struct b43_wldev *dev)
@@ -3458,6 +3454,13 @@ static void b43_nphy_workarounds(struct b43_wldev *dev)
 		b43_nphy_workarounds_rev3plus(dev);
 	else
 		b43_nphy_workarounds_rev1_2(dev);
+
+	/* Send CCK on core 0 only (host flag 0x0080000000000000) */
+	if (phy->rev >= 6 &&
+	    dev->dev->bus_sprom->boardflags2_lo & B43_BFL2_SINGLEANT_CCK)
+		b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_HOSTF4,
+				b43_shm_read16(dev, B43_SHM_SHARED,
+					       B43_SHM_SH_HOSTF4) | 0x0080);
 
 	if (nphy->hang_avoid)
 		b43_nphy_stay_in_carrier_search(dev, 0);
