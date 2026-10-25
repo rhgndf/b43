@@ -351,8 +351,12 @@ struct b43_rxhdr_fw4 {
 #define B43_RX_MAC_TKIP_MICERR		0x00100000 /* TKIP MIC error */
 #define B43_RX_MAC_TKIP_MICATT		0x00080000 /* TKIP MIC attempted */
 #define B43_RX_MAC_AGGTYPE		0x00060000 /* Aggregation type */
+#define  B43_RX_MAC_AGGTYPE_MIDDLE	0x00000000 /* A-MSDU piece types */
+#define  B43_RX_MAC_AGGTYPE_FIRST	0x00020000
+#define  B43_RX_MAC_AGGTYPE_LAST	0x00040000
+#define  B43_RX_MAC_AGGTYPE_WHOLE	0x00060000
 #define B43_RX_MAC_AGGTYPE_SHIFT	17
-#define B43_RX_MAC_AMSDU		0x00010000 /* A-MSDU mask */
+#define B43_RX_MAC_AMSDU		0x00010000 /* A-MSDU piece */
 #define B43_RX_MAC_BEACONSENT		0x00008000 /* Beacon sent flag */
 #define B43_RX_MAC_KEYIDX		0x000007E0 /* Key index */
 #define B43_RX_MAC_KEYIDX_SHIFT		5

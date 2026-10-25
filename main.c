@@ -4939,6 +4939,8 @@ redo:
 	mask = b43_read32(dev, B43_MMIO_GEN_IRQ_MASK);
 	B43_WARN_ON(mask != 0xFFFFFFFF && mask);
 	dev->rx_ht_valid = false;
+	dev_kfree_skb(dev->rx_amsdu);
+	dev->rx_amsdu = NULL;
 
 	/* Drain all TX queues. */
 	for (queue_num = 0; queue_num < B43_QOS_QUEUE_NUM; queue_num++) {
@@ -6150,7 +6152,8 @@ static int b43_setup_bands(struct b43_wldev *dev,
 		ht = &dev->band_2ghz_ht.ht_cap;
 		ht->ht_supported = true;
 		/* Both RX chains stay awake. */
-		ht->cap = IEEE80211_HT_CAP_SM_PS | IEEE80211_HT_CAP_SGI_20;
+		ht->cap = IEEE80211_HT_CAP_SM_PS | IEEE80211_HT_CAP_SGI_20 |
+			  IEEE80211_HT_CAP_MAX_AMSDU;
 		ht->ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K;
 		ht->ampdu_density = IEEE80211_HT_MPDU_DENSITY_4;
 		ht->mcs.rx_mask[0] = 0xff;

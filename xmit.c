@@ -1045,8 +1045,72 @@ invalid:
 	return NULL;
 }
 
+/* PSDU length from the PLCP header. */
+static unsigned int b43_rx_psdu_len(const u8 *plcp, u16 phystat0)
+{
+	switch (phystat0 & B43_RX_PHYST0_FTYPE) {
+	case 0:
+		/* CCK gives microseconds at a rate in 100 kbit/s, and a bit
+		 * saying that rounding them up added a byte at 11 Mbit/s.
+		 */
+		return get_unaligned_le16(plcp + 2) * (plcp[0] / 5) / 16 -
+		       !!(plcp[1] & 0x80);
+	case B43_RX_PHYST0_OFDM:
+		return (get_unaligned_le32(plcp) >> 5) & 0xFFF;
+	case B43_RX_PHYST0_PRE_N:
+		return get_unaligned_le16(plcp + 1);
+	}
+	return 0;
+}
+
+/* Outside an A-MPDU the microcode passes a received A-MSDU on in pieces,
+ * one per subframe. The first piece also holds the PLCP and MAC headers,
+ * the last one the MIC and the FCS. Returns the joined frame after the last
+ * piece if it is as long as the PLCP header says.
+ */
+static struct sk_buff *b43_rx_amsdu(struct b43_wldev *dev, struct sk_buff *skb,
+				    u32 macstat, u16 phystat0)
+{
+	struct sk_buff *amsdu = dev->rx_amsdu;
+	unsigned int padding = (macstat & B43_RX_MAC_PADDING) ? 2 : 0;
+	unsigned int len;
+
+	if ((macstat & B43_RX_MAC_AGGTYPE) == B43_RX_MAC_AGGTYPE_FIRST) {
+		dev_kfree_skb(amsdu);
+		amsdu = NULL;
+		len = 0;
+		if (skb->len >= padding + sizeof(struct b43_plcp_hdr6))
+			len = b43_rx_psdu_len(skb->data + padding, phystat0);
+		if (len && len <= IEEE80211_MAX_MPDU_LEN_VHT_7991)
+			amsdu = dev_alloc_skb(sizeof(struct b43_plcp_hdr6) +
+					      len);
+		dev->rx_amsdu = amsdu;
+	}
+	if (!amsdu || skb->len < padding ||
+	    skb->len - padding > skb_tailroom(amsdu))
+		goto drop;
+	skb_put_data(amsdu, skb->data + padding, skb->len - padding);
+	dev_kfree_skb(skb);
+	if ((macstat & B43_RX_MAC_AGGTYPE) != B43_RX_MAC_AGGTYPE_LAST)
+		return NULL;
+	dev->rx_amsdu = NULL;
+	if (amsdu->len != sizeof(struct b43_plcp_hdr6) +
+			  b43_rx_psdu_len(amsdu->data, phystat0))
+		goto drop_amsdu;
+	return amsdu;
+
+drop:
+	dev_kfree_skb(skb);
+drop_amsdu:
+	b43dbg(dev->wl, "RX: Dropping incomplete A-MSDU\n");
+	dev_kfree_skb(amsdu);
+	dev->rx_amsdu = NULL;
+	return NULL;
+}
+
 void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 {
+	struct b43_rxhdr_fw4 amsdu_rxhdr;
 	struct ieee80211_rx_status status;
 	struct b43_plcp_hdr6 *plcp;
 	const u8 *ht_plcp = NULL;
@@ -1076,6 +1140,19 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 		mactime = le16_to_cpu(rxhdr->format_351.mac_time);
 		chanstat = le16_to_cpu(rxhdr->format_351.channel);
 		break;
+	}
+	if (unlikely((macstat & B43_RX_MAC_AMSDU) &&
+		     (macstat & B43_RX_MAC_AGGTYPE) !=
+		     B43_RX_MAC_AGGTYPE_WHOLE)) {
+		/* b43_rx_amsdu() frees the piece, which can hold the header.
+		 * The last piece has the status of the whole frame.
+		 */
+		amsdu_rxhdr = *rxhdr;
+		rxhdr = &amsdu_rxhdr;
+		skb = b43_rx_amsdu(dev, skb, macstat, phystat0);
+		if (!skb)
+			return;
+		macstat &= ~B43_RX_MAC_PADDING;
 	}
 	/* brcmsmac treats frame type 3 as an error, and the BCM43227 was
 	 * not seen to report it.

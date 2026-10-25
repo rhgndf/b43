@@ -863,6 +863,8 @@ struct b43_wldev {
 	u16 rx_ht_channel;
 	u8 rx_ht_plcp[6];
 	bool rx_ht_valid;
+	/* A-MSDU pieces received so far, protected by wl->mutex. */
+	struct sk_buff *rx_amsdu;
 	/* Acked A-MPDU TX status awaiting its Block Ack bitmap package. */
 	u32 ampdu_txstat[2];
 	bool ampdu_txstat_pending;
