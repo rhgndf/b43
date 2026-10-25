@@ -1228,6 +1228,11 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 			status.mactime -= 0x10000;
 		status.flag |= RX_FLAG_MACTIME_START;
 	}
+	if (dev->wl->ps_enabled && !ieee80211_is_ctl(fctl) &&
+	    !(status.flag & RX_FLAG_FAILED_FCS_CRC) &&
+	    skb->len >= sizeof(struct ieee80211_hdr_3addr) &&
+	    ether_addr_equal(wlhdr->addr2, dev->wl->bssid))
+		b43_ps_rx(dev, skb);
 
 	chanid = (chanstat & B43_RX_CHAN_ID) >> B43_RX_CHAN_ID_SHIFT;
 	switch (chanstat & B43_RX_CHAN_PHYTYPE) {

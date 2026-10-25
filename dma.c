@@ -1743,6 +1743,7 @@ int b43_dma_tx_ampdu(struct b43_wldev *dev, struct ieee80211_txq *txq,
 	skb = b43_ampdu_tx_peek(wl, txq, t);
 	if (!skb)
 		return 0;
+	b43_tx_update_hwps(dev, skb);
 	b43_ampdu_tx_rates(wl, txq, t, skb);
 	first = IEEE80211_SKB_CB(skb);
 	if (!b43_ampdu_tx_member(skb) ||
@@ -2146,6 +2147,8 @@ void b43_dma_handle_txstatus(struct b43_wldev *dev,
 				ring->nr_failed_tx_packets++;
 			ring->nr_total_packet_tries += status->frame_count;
 #endif /* DEBUG */
+			b43_ps_tx_status(dev, meta->skb,
+					 info->flags & IEEE80211_TX_STAT_ACK);
 			ieee80211_tx_status_skb(dev->wl->hw, meta->skb);
 
 			/* skb will be freed by ieee80211_tx_status_skb().

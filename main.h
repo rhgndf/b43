@@ -82,6 +82,9 @@ void b43_controller_restart(struct b43_wldev *dev, const char *reason);
 #define B43_PS_AWAKE	(1 << 2)	/* Force device awake */
 #define B43_PS_ASLEEP	(1 << 3)	/* Force device asleep */
 void b43_power_saving_ctl_bits(struct b43_wldev *dev, unsigned int ps_flags);
+void b43_ps_rx(struct b43_wldev *dev, struct sk_buff *skb);
+void b43_ps_tx_status(struct b43_wldev *dev, struct sk_buff *skb, bool acked);
+void b43_tx_update_hwps(struct b43_wldev *dev, struct sk_buff *skb);
 
 void b43_wireless_core_phy_pll_reset(struct b43_wldev *dev);
 

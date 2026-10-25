@@ -866,6 +866,17 @@ struct b43_wldev {
 	/* Acked A-MPDU TX status awaiting its Block Ack bitmap package. */
 	u32 ampdu_txstat[2];
 	bool ampdu_txstat_pending;
+	/* Station power save, protected by wl->mutex: whether the station
+	 * dozes, from the AP's acknowledgement of a null frame with PM=1
+	 * until it wakes up, the HWPS bit, which the microcode copies into
+	 * the PM bit of every frame it transmits, whether a beacon has
+	 * checked the TBTT timer since the station started dozing, and
+	 * whether a PS-Poll awaits its response.
+	 */
+	bool ps;
+	bool hwps;
+	bool ps_tbtt;
+	bool ps_poll;
 
 	/* PHY/Radio device. */
 	struct b43_phy phy;
@@ -1006,6 +1017,17 @@ struct b43_wl {
 
 	/* Packet transmit work */
 	struct work_struct tx_work;
+
+	/* Station power save, protected by wl->mutex: whether mac80211
+	 * allows it, whether a scan holds the station awake, whether the AP
+	 * has acknowledged the last null frame with PM=1, the last frame to
+	 * or from the AP, and the work that enters power save.
+	 */
+	bool ps_enabled;
+	bool ps_scanning;
+	bool ps_null_acked;
+	unsigned long ps_last;
+	struct delayed_work ps_work;
 
 	/* Queue of packets to be transmitted. */
 	struct sk_buff_head tx_queue[B43_QOS_QUEUE_NUM];
