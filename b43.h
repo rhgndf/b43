@@ -843,6 +843,8 @@ struct b43_wldev {
 	bool qos_enabled;		/* TRUE, if QoS is used. */
 	bool hwcrypto_enabled;		/* TRUE, if HW crypto acceleration is enabled. */
 	bool use_pio;			/* TRUE if next init should use PIO */
+	/* HT support */
+	bool ht;
 
 	/* PHY/Radio device. */
 	struct b43_phy phy;

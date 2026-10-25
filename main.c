@@ -1568,7 +1568,7 @@ static void b43_write_template_common(struct b43_wldev *dev,
 	struct b43_plcp_hdr4 plcp;
 
 	plcp.data = 0;
-	b43_generate_plcp_hdr(&plcp, size + FCS_LEN, rate);
+	b43_generate_plcp_hdr(&plcp, size + FCS_LEN, rate, false);
 	b43_ram_write(dev, ram_offset, le32_to_cpu(plcp.data));
 	ram_offset += sizeof(u32);
 	/* The PLCP is 6 bytes long, but we only wrote 4 bytes, yet.
