@@ -413,10 +413,10 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	 */
 	if ((rates[0].flags & IEEE80211_TX_RC_USE_RTS_CTS) ||
 	    (rates[0].count <= dev->wl->hw->conf.long_frame_max_tx_count)) {
-		rates[0].count = dev->wl->hw->conf.long_frame_max_tx_count;
+		rates[0].count = B43_LONG_FALLBACK_LIMIT;
 		mac_ctl |= B43_TXH_MAC_LONGFRAME;
 	} else {
-		rates[0].count = dev->wl->hw->conf.short_frame_max_tx_count;
+		rates[0].count = B43_SHORT_FALLBACK_LIMIT;
 	}
 
 	/* Generate the RTS or CTS-to-self frame */
@@ -882,7 +882,8 @@ bool b43_fill_txstatus_report(struct b43_wldev *dev,
 		report->status.rates[0].count = 0;
 		report->status.rates[1].count = status->frame_count;
 	} else {
-		if (status->frame_count > retry_limit) {
+		if (status->frame_count > retry_limit &&
+		    report->status.rates[1].idx >= 0) {
 			report->status.rates[0].count = retry_limit;
 			report->status.rates[1].count = status->frame_count -
 					retry_limit;
