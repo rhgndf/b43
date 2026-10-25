@@ -777,8 +777,10 @@ static void b43_radio_2057_setup(struct b43_wldev *dev,
 				txmix2g_tune_boost_pu = 0x0041;
 				if (tabent_r7->freq < 2442)
 					pad2g_tune_pus = 0x43;
-				else
+				else if (tabent_r7->freq < 2467)
 					pad2g_tune_pus = 0x33;
+				else
+					pad2g_tune_pus = 0x23;
 				break;
 			case 14:
 				txmix2g_tune_boost_pu = 0x21;

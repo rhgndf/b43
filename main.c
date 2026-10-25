@@ -212,6 +212,8 @@ static struct ieee80211_channel b43_2ghz_chantable[] = {
 
 /* No support for the last 3 channels (12, 13, 14) */
 #define b43_2ghz_chantable_limited_size		11
+/* No support for channel 14 */
+#define b43_2ghz_chantable_no_ch14_size		13
 #undef CHAN2G
 
 #define CHAN4G(_channel, _flags) {				\
@@ -357,6 +359,14 @@ static struct ieee80211_supported_band b43_band_2ghz_limited = {
 	.band		= NL80211_BAND_2GHZ,
 	.channels	= b43_2ghz_chantable,
 	.n_channels	= b43_2ghz_chantable_limited_size,
+	.bitrates	= b43_g_ratetable,
+	.n_bitrates	= b43_g_ratetable_size,
+};
+
+static struct ieee80211_supported_band b43_band_2ghz_no_ch14 = {
+	.band		= NL80211_BAND_2GHZ,
+	.channels	= b43_2ghz_chantable,
+	.n_channels	= b43_2ghz_chantable_no_ch14_size,
 	.bitrates	= b43_g_ratetable,
 	.n_bitrates	= b43_g_ratetable_size,
 };
@@ -5335,18 +5345,19 @@ static int b43_setup_bands(struct b43_wldev *dev,
 {
 	struct ieee80211_hw *hw = dev->wl->hw;
 	struct b43_phy *phy = &dev->phy;
-	bool limited_2g;
+	struct ieee80211_supported_band *band_2g = &b43_band_2GHz;
 	bool limited_5g;
 
 	/* We don't support all 2 GHz channels on some devices */
-	limited_2g = phy->radio_ver == 0x2057 &&
-		     (phy->radio_rev == 9 || phy->radio_rev == 14);
+	if (phy->radio_ver == 0x2057 && phy->radio_rev == 9)
+		band_2g = &b43_band_2ghz_no_ch14;
+	else if (phy->radio_ver == 0x2057 && phy->radio_rev == 14)
+		band_2g = &b43_band_2ghz_limited;
 	limited_5g = phy->radio_ver == 0x2057 &&
 		     phy->radio_rev == 9;
 
 	if (have_2ghz_phy)
-		hw->wiphy->bands[NL80211_BAND_2GHZ] = limited_2g ?
-			&b43_band_2ghz_limited : &b43_band_2GHz;
+		hw->wiphy->bands[NL80211_BAND_2GHZ] = band_2g;
 	if (dev->phy.type == B43_PHYTYPE_N) {
 		if (have_5ghz_phy)
 			hw->wiphy->bands[NL80211_BAND_5GHZ] = limited_5g ?
