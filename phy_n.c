@@ -770,6 +770,8 @@ static void b43_radio_2057_setup(struct b43_wldev *dev,
 	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
 		u16 txmix2g_tune_boost_pu = 0;
 		u16 pad2g_tune_pus = 0;
+		/* Tuned lower at 40 MHz */
+		u16 pad40[2] = { 0, 0 };
 
 		if (b43_nphy_ipa(dev)) {
 			switch (phy->radio_rev) {
@@ -781,6 +783,10 @@ static void b43_radio_2057_setup(struct b43_wldev *dev,
 					pad2g_tune_pus = 0x33;
 				else
 					pad2g_tune_pus = 0x23;
+				if (b43_is_40mhz(dev)) {
+					pad40[0] = 0x20;
+					pad40[1] = 0x10;
+				}
 				break;
 			case 14:
 				txmix2g_tune_boost_pu = 0x21;
@@ -794,13 +800,13 @@ static void b43_radio_2057_setup(struct b43_wldev *dev,
 					txmix2g_tune_boost_pu);
 		if (pad2g_tune_pus)
 			b43_radio_write(dev, R2057_PAD2G_TUNE_PUS_CORE0,
-					pad2g_tune_pus);
+					pad2g_tune_pus - pad40[0]);
 		if (txmix2g_tune_boost_pu)
 			b43_radio_write(dev, R2057_TXMIX2G_TUNE_BOOST_PU_CORE1,
 					txmix2g_tune_boost_pu);
 		if (pad2g_tune_pus)
 			b43_radio_write(dev, R2057_PAD2G_TUNE_PUS_CORE1,
-					pad2g_tune_pus);
+					pad2g_tune_pus - pad40[1]);
 	}
 
 	usleep_range(50, 100);
@@ -2502,24 +2508,28 @@ static void b43_nphy_gain_ctl_workarounds_rev7(struct b43_wldev *dev)
 {
 	static const s8 lna1_gain[] = { 9, 14, 18, 24 };
 	static const s8 lna2_gain[] = { -2, 7, 11, 16 };
+	bool is40 = b43_is_40mhz(dev);
+	u16 crsminpwr = is40 ? 0x53 : 0x50;
+	u16 medgain_a = is40 ? 0x006a : 0x0062;
+	u16 medgain_b = is40 ? 0x0004 : 0x0034;
 
 	if (!b43_nphy_2057_rev9_2g(dev))
 		return;
 
 	b43_phy_set(dev, B43_NPHY_C1_CGAINI, B43_NPHY_C1_CGAINI_CL2DETECT);
 	b43_phy_set(dev, B43_NPHY_C2_CGAINI, B43_NPHY_C2_CGAINI_CL2DETECT);
-	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWER0, 0xff00, 0x50);
-	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWERU0, 0xff00, 0x50);
-	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWERL0, 0xff00, 0x50);
+	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWER0, 0xff00, crsminpwr);
+	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWERU0, 0xff00, crsminpwr);
+	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWERL0, 0xff00, crsminpwr);
 
 	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_LOGAIN_A, 0x0070);
 	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_LOGAIN_A, 0x0070);
 	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_LOGAIN_B, 0x0218);
 	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_LOGAIN_B, 0x0218);
-	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_MEDGAIN_A, 0x0062);
-	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_MEDGAIN_A, 0x0062);
-	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_MEDGAIN_B, 0x0034);
-	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_MEDGAIN_B, 0x0034);
+	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_MEDGAIN_A, medgain_a);
+	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_MEDGAIN_A, medgain_a);
+	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_MEDGAIN_B, medgain_b);
+	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_MEDGAIN_B, medgain_b);
 
 	b43_ntab_write_bulk(dev, B43_NTAB8(0, 8), 4, lna1_gain);
 	b43_ntab_write_bulk(dev, B43_NTAB8(1, 8), 4, lna1_gain);
@@ -2801,7 +2811,8 @@ static void b43_nphy_workarounds_rev7plus(struct b43_wldev *dev)
 	}
 
 	if (phy->rev >= 16)
-		b43_phy_maskset(dev, B43_NPHY_TXTAILCNT, ~0xFF, 0xa0);
+		b43_phy_maskset(dev, B43_NPHY_TXTAILCNT, ~0xFF,
+				b43_is_40mhz(dev) ? 100 : 160);
 	else if (phy->rev >= 8)
 		b43_phy_maskset(dev, B43_NPHY_TXTAILCNT, ~0xFF, 0x72);
 
@@ -7979,6 +7990,11 @@ static void b43_nphy_channel_setup(struct b43_wldev *dev,
 
 	b43_phy_write(dev, B43_NPHY_NDATAT_DUP40, 0x3830);
 
+	/* Set at 40 MHz only; it helps to receive weak signals. */
+	if (phy->rev == 16)
+		b43_phy_maskset(dev, 0x324, ~0x100,
+				b43_is_40mhz(dev) ? 0x100 : 0);
+
 	if (phy->rev >= 3)
 		b43_nphy_spur_workaround(dev);
 }
@@ -7994,6 +8010,8 @@ static int b43_nphy_set_channel(struct b43_wldev *dev,
 	const struct b43_nphy_channeltab_entry_rev3 *tabent_r3 = NULL;
 	const struct b43_nphy_chantabent_rev7 *tabent_r7 = NULL;
 	const struct b43_nphy_chantabent_rev7_2g *tabent_r7_2g = NULL;
+	/* The radio tunes to the centre of a 40 MHz channel. */
+	u16 freq = dev->phy.chandef->center_freq1;
 
 	u8 tmp;
 
@@ -8001,18 +8019,16 @@ static int b43_nphy_set_channel(struct b43_wldev *dev,
 		return -ESRCH;
 		/* TODO */
 	} else if (phy->rev >= 7) {
-		r2057_get_chantabent_rev7(dev, channel->center_freq,
-					  &tabent_r7, &tabent_r7_2g);
+		r2057_get_chantabent_rev7(dev, freq, &tabent_r7, &tabent_r7_2g);
 		if (!tabent_r7 && !tabent_r7_2g)
 			return -ESRCH;
 	} else if (phy->rev >= 3) {
-		tabent_r3 = b43_nphy_get_chantabent_rev3(dev,
-							channel->center_freq);
+		tabent_r3 = b43_nphy_get_chantabent_rev3(dev, freq);
 		if (!tabent_r3)
 			return -ESRCH;
 	} else {
 		tabent_r2 = b43_nphy_get_chantabent_rev2(dev,
-							channel->hw_value);
+				b43_phy_center_channel(dev));
 		if (!tabent_r2)
 			return -ESRCH;
 	}

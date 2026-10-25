@@ -423,11 +423,11 @@ int b43_switch_channel(struct b43_wldev *dev, unsigned int new_channel)
 	 * firmware from sending ghost packets.
 	 */
 	channelcookie = new_channel;
+	if (b43_is_40mhz(dev))
+		channelcookie = b43_phy_center_channel(dev) |
+				B43_SHM_SH_CHAN_40MHZ;
 	if (b43_current_band(dev->wl) == NL80211_BAND_5GHZ)
 		channelcookie |= B43_SHM_SH_CHAN_5GHZ;
-	/* FIXME: set 40Mhz flag if required */
-	if (0)
-		channelcookie |= B43_SHM_SH_CHAN_40MHZ;
 	savedcookie = b43_shm_read16(dev, B43_SHM_SHARED, B43_SHM_SH_CHAN);
 	b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_CHAN, channelcookie);
 
@@ -557,6 +557,12 @@ void b43_phyop_switch_analog_generic(struct b43_wldev *dev, bool on)
 bool b43_is_40mhz(struct b43_wldev *dev)
 {
 	return dev->phy.chandef->width == NL80211_CHAN_WIDTH_40;
+}
+
+/* The microcode takes the centre channel of a 40 MHz channel. */
+unsigned int b43_phy_center_channel(struct b43_wldev *dev)
+{
+	return ieee80211_frequency_to_channel(dev->phy.chandef->center_freq1);
 }
 
 /* https://bcm-v4.sipsolutions.net/802.11/PHY/N/BmacPhyClkFgc */
