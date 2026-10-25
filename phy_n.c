@@ -2530,6 +2530,10 @@ static void b43_nphy_gain_ctl_workarounds_rev7(struct b43_wldev *dev)
 	/* Pulse this unnamed bit after loading the gains. */
 	b43_phy_set(dev, B43_NPHY_RXCTL, 0x2000);
 	b43_phy_mask(dev, B43_NPHY_RXCTL, ~0x2000);
+
+	b43_phy_write(dev, B43_NPHY_BPHY_CTL1, 0);
+	b43_phy_write(dev, B43_NPHY_CRSHIGHPOWTHRESHOLD1U, 0xcf80);
+	b43_phy_write(dev, B43_NPHY_CRSHIGHPOWTHRESHOLD1L, 0xcf80);
 }
 
 static void b43_nphy_gain_ctl_workarounds_rev3(struct b43_wldev *dev)
