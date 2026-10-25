@@ -6408,11 +6408,11 @@ static int b43_nphy_set_channel(struct b43_wldev *dev,
 		; /* TODO: BMAC BW Set (channel_type) */
 #endif
 
-	if (channel_type == NL80211_CHAN_HT40PLUS) {
+	if (channel_type == NL80211_CHAN_HT40MINUS) {
 		b43_phy_set(dev, B43_NPHY_RXCTL, B43_NPHY_RXCTL_BSELU20);
 		if (phy->rev >= 7)
 			b43_phy_set(dev, 0x310, 0x8000);
-	} else if (channel_type == NL80211_CHAN_HT40MINUS) {
+	} else if (channel_type == NL80211_CHAN_HT40PLUS) {
 		b43_phy_mask(dev, B43_NPHY_RXCTL, ~B43_NPHY_RXCTL_BSELU20);
 		if (phy->rev >= 7)
 			b43_phy_mask(dev, 0x310, 0x7fff);
