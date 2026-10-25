@@ -845,6 +845,7 @@ struct b43_wldev {
 	bool use_pio;			/* TRUE if next init should use PIO */
 	/* HT support */
 	bool ht;
+	struct ieee80211_supported_band band_2ghz_ht;
 
 	/* PHY/Radio device. */
 	struct b43_phy phy;

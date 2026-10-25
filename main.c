@@ -4725,6 +4725,10 @@ static int b43_phy_versioning(struct b43_wldev *dev)
 	phy->type = phy_type;
 	phy->rev = phy_rev;
 
+	/* The BCM43227's core, N-PHY and radio revisions */
+	dev->ht = core_rev == 30 && phy_type == B43_PHYTYPE_N &&
+		  phy_rev == 16 && radio_rev == 9;
+
 	return 0;
 }
 
@@ -5406,6 +5410,23 @@ static int b43_setup_bands(struct b43_wldev *dev,
 	} else {
 		if (have_5ghz_phy)
 			hw->wiphy->bands[NL80211_BAND_5GHZ] = &b43_band_5GHz_aphy;
+	}
+
+	/* Keep the shared legacy band templates unchanged. */
+	dev->ht = dev->ht && modparam_qos && have_2ghz_phy;
+	if (dev->ht) {
+		struct ieee80211_sta_ht_cap *ht;
+
+		dev->band_2ghz_ht = *hw->wiphy->bands[NL80211_BAND_2GHZ];
+		ht = &dev->band_2ghz_ht.ht_cap;
+		ht->ht_supported = true;
+		ht->cap = IEEE80211_HT_CAP_SM_PS; /* Both RX chains stay awake. */
+		ht->mcs.rx_mask[0] = 0xff;
+		ht->mcs.rx_mask[1] = 0xff;
+		ht->mcs.rx_highest = cpu_to_le16(130);
+		ht->mcs.tx_params = IEEE80211_HT_MCS_TX_DEFINED;
+		/* No AMPDU_AGGREGATION flag or BA-session callback. */
+		hw->wiphy->bands[NL80211_BAND_2GHZ] = &dev->band_2ghz_ht;
 	}
 
 	dev->phy.supports_2ghz = have_2ghz_phy;
