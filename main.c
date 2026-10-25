@@ -5196,8 +5196,11 @@ static int b43_op_get_survey(struct ieee80211_hw *hw, int idx,
 		return -ENOENT;
 
 	survey->channel = conf->chandef.chan;
-	survey->filled = SURVEY_INFO_NOISE_DBM;
-	survey->noise = dev->stats.link_noise;
+	/* link_noise stays 0 until a noise measurement completes. */
+	if (dev->stats.link_noise) {
+		survey->filled = SURVEY_INFO_NOISE_DBM;
+		survey->noise = dev->stats.link_noise;
+	}
 
 	return 0;
 }
