@@ -5127,7 +5127,7 @@ static void b43_nphy_tx_cal_phy_setup(struct b43_wldev *dev)
 				b43_nphy_rf_ctl_override_rev7(dev, 0x8, 0, 0x3,
 							      false, 0);
 			} else if (phy->rev == 7) {
-				b43_radio_maskset(dev, R2057_OVR_REG0, 1 << 4, 1 << 4);
+				b43_radio_maskset(dev, R2057_OVR_REG0, ~(1 << 4), 1 << 4);
 				if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
 					b43_radio_maskset(dev, R2057_PAD2G_TUNE_PUS_CORE0, ~1, 0);
 					b43_radio_maskset(dev, R2057_PAD2G_TUNE_PUS_CORE1, ~1, 0);
