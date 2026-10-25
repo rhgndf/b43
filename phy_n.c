@@ -8039,6 +8039,7 @@ static void b43_nphy_channel_setup(struct b43_wldev *dev,
 			  0x73, 0xb2, 0x73, 0xfdfe, 0xcc },
 		};
 		bool ch13 = ch == 13;
+		bool is40 = b43_is_40mhz(dev);
 		int i;
 
 		for (i = 0; i < ARRAY_SIZE(strnfilt[0]); i++)
@@ -8051,12 +8052,18 @@ static void b43_nphy_channel_setup(struct b43_wldev *dev,
 		b43_ntab_write(dev, B43_NTAB32(16, 0x33), ch13 ? 0x18d : 0x14d);
 		b43_ntab_write(dev, B43_NTAB32(16, 0x35), ch13 ? 0x18d : 0x14d);
 
+		/* At 20 MHz, TISRC_TLEN keeps its reset value. */
+		b43_phy_write(dev, 0x09f, 1);
+		b43_phy_write(dev, B43_NPHY_NONPAYDECODETIMEOUTLEN, is40 ? 2 : 1);
+		b43_phy_write(dev, B43_NPHY_TISRC_TLEN, is40 ? 0x41a : 0x1e0);
+		b43_phy_write(dev, B43_NPHY_TIMEOUTEN, 4);
+		b43_phy_write(dev, 0x30b, 0x41a);
+		b43_phy_maskset(dev, 0x323, ~0xff, is40 ? 0x39 : 0x40);
+
 		/* Set at 40 MHz only; it helps to receive weak signals. */
-		b43_phy_maskset(dev, 0x324, ~0x100,
-				b43_is_40mhz(dev) ? 0x100 : 0);
+		b43_phy_maskset(dev, 0x324, ~0x100, is40 ? 0x100 : 0);
 		b43_ntab_write_bulk(dev, B43_NTAB32(16, 0x100),
-				    ARRAY_SIZE(nvar20),
-				    b43_is_40mhz(dev) ? nvar40 : nvar20);
+				    ARRAY_SIZE(nvar20), is40 ? nvar40 : nvar20);
 	}
 
 	if (phy->rev >= 3)
