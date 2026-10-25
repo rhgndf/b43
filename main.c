@@ -5262,11 +5262,13 @@ static void b43_chip_reset(struct work_struct *work)
 			goto out;
 	}
 	if (prev_status >= B43_STAT_STARTED) {
-		err = b43_wireless_core_start(dev);
-		if (err) {
-			b43_wireless_core_exit(dev);
-			goto out;
-		}
+		/* The reset cleared the keys. mac80211 starts the device again
+		 * and re-adds the interface, keys and station state. */
+		wl->operating = false;
+		wl->vif = NULL;
+		mutex_unlock(&wl->mutex);
+		ieee80211_restart_hw(wl->hw);
+		return;
 	}
 out:
 	if (err)
