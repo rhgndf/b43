@@ -958,9 +958,7 @@ static u16 b43_radio_2057_rccal(struct b43_wldev *dev)
 	if (!b43_radio_wait_value(dev, R2057_RCCAL_DONE_OSCCAP, 2, 2, 500,
 				  5000000))
 		b43dbg(dev->wl, "Radio 0x2057 rccal timeout\n");
-	usleep_range(35, 70);
 	b43_radio_write(dev, R2057_RCCAL_START_R1_Q1_P1, 0x15);
-	usleep_range(70, 140);
 
 	/* Setup cal */
 	if (special) {
@@ -973,15 +971,11 @@ static u16 b43_radio_2057_rccal(struct b43_wldev *dev)
 	b43_radio_write(dev, R2057_RCCAL_X1, 0x6E);
 
 	/* Start, wait, stop */
-	usleep_range(35, 70);
 	b43_radio_write(dev, R2057_RCCAL_START_R1_Q1_P1, 0x55);
-	usleep_range(70, 140);
 	if (!b43_radio_wait_value(dev, R2057_RCCAL_DONE_OSCCAP, 2, 2, 500,
 				  5000000))
 		b43dbg(dev->wl, "Radio 0x2057 rccal timeout\n");
-	usleep_range(35, 70);
 	b43_radio_write(dev, R2057_RCCAL_START_R1_Q1_P1, 0x15);
-	usleep_range(70, 140);
 
 	/* Setup cal */
 	if (special) {
@@ -995,18 +989,14 @@ static u16 b43_radio_2057_rccal(struct b43_wldev *dev)
 	}
 
 	/* Start, wait, stop */
-	usleep_range(35, 70);
 	b43_radio_write(dev, R2057_RCCAL_START_R1_Q1_P1, 0x55);
-	usleep_range(70, 140);
 	if (!b43_radio_wait_value(dev, R2057_RCCAL_DONE_OSCCAP, 2, 2, 500,
 				  5000000)) {
 		b43err(dev->wl, "Radio 0x2057 rcal timeout\n");
 		return 0;
 	}
 	tmp = b43_radio_read(dev, R2057_RCCAL_DONE_OSCCAP);
-	usleep_range(35, 70);
 	b43_radio_write(dev, R2057_RCCAL_START_R1_Q1_P1, 0x15);
-	usleep_range(70, 140);
 
 	if (special)
 		b43_radio_mask(dev, R2057_RCCAL_MASTER, ~0x1);
