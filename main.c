@@ -4040,6 +4040,8 @@ static int b43_op_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 		 * The firmware takes care of races with the TX handler.
 		 */
 		b43_switch_channel(dev, phy->channel);
+		if (phy->ops->calibrate)
+			phy->ops->calibrate(dev);
 	}
 
 	if (changed & IEEE80211_CONF_CHANGE_RETRY_LIMITS)
@@ -4372,6 +4374,8 @@ redo:
 	/* Cancel work. Unlock to avoid deadlocks. */
 	mutex_unlock(&wl->mutex);
 	cancel_delayed_work_sync(&dev->periodic_work);
+	if (IS_ENABLED(CONFIG_B43_PHY_N) && dev->phy.type == B43_PHYTYPE_N)
+		b43_nphy_cancel_calibration(dev);
 	cancel_work_sync(&wl->tx_work);
 	b43_leds_stop(dev);
 	mutex_lock(&wl->mutex);

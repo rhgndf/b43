@@ -304,6 +304,7 @@ enum {
 #define B43_SHM_SH_BCN_LI		0x00B6	/* beacon listen interval */
 /* SHM_SHARED ACK/CTS control */
 #define B43_SHM_SH_ACKCTSPHYCTL		0x0022	/* ACK/CTS PHY control word (see PHY TX control) */
+#define B43_SHM_SH_CTSDUR		0x00B8	/* CTS duration (us) sent on the next MAC suspend */
 /* SHM_SHARED probe response variables */
 #define B43_SHM_SH_PRSSID		0x0160	/* Probe Response SSID */
 #define B43_SHM_SH_PRSSIDLEN		0x0048	/* Probe Response SSID length */

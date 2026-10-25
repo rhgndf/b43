@@ -143,6 +143,8 @@ enum b43_txpwr_result {
  * 			Can be NULL, if (and ONLY if) @recalc_txpower _always_
  * 			returns B43_TXPWR_RES_DONE.
  *
+ * @calibrate:		Called after tuning to a channel. Calibrate if needed.
+ * 			Can be NULL, if not required.
  * @pwork_15sec:	Periodic work. Called every 15 seconds.
  * 			Can be NULL, if not required.
  * @pwork_60sec:	Periodic work. Called every 60 seconds.
@@ -180,6 +182,7 @@ struct b43_phy_operations {
 	void (*adjust_txpower)(struct b43_wldev *dev);
 
 	/* Misc */
+	void (*calibrate)(struct b43_wldev *dev);
 	void (*pwork_15sec)(struct b43_wldev *dev);
 	void (*pwork_60sec)(struct b43_wldev *dev);
 };

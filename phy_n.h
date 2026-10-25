@@ -2,6 +2,8 @@
 #ifndef B43_NPHY_H_
 #define B43_NPHY_H_
 
+#include <linux/workqueue.h>
+
 #include "phy_common.h"
 #include "ppr.h"
 
@@ -933,6 +935,13 @@ struct b43_phy_n_pwr_ctl_info {
 
 struct b43_nphy_calibration;
 
+enum b43_nphy_cal_phase {
+	B43_NPHY_CAL_ALL,
+	B43_NPHY_CAL_TX,
+	B43_NPHY_CAL_PAPD,
+	B43_NPHY_CAL_RX,
+};
+
 struct b43_phy_n {
 	u8 antsel_type;
 	u8 cal_orig_pwr_idx[2];
@@ -959,6 +968,7 @@ struct b43_phy_n {
 	u16 mphase_txcal_cmdidx;
 	u16 mphase_txcal_numcmds;
 	u16 mphase_txcal_bestcoeffs[11];
+	unsigned long cal_time;
 
 	bool txpwrctrl;
 	bool pwg_gain_5ghz;
@@ -1002,10 +1012,15 @@ struct b43_phy_n {
 	bool crsminpwr_adjusted;
 	bool noisevars_adjusted;
 	struct b43_nphy_calibration *calibration;
+	struct b43_wldev *dev;
+	struct delayed_work cal_work;
+	/* The periodic calibration's next phase, B43_NPHY_CAL_ALL for none. */
+	enum b43_nphy_cal_phase cal_phase;
 };
 
 
 struct b43_phy_operations;
 extern const struct b43_phy_operations b43_phyops_n;
+void b43_nphy_cancel_calibration(struct b43_wldev *dev);
 
 #endif /* B43_NPHY_H_ */

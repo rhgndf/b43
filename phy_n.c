@@ -7318,6 +7318,109 @@ static u16 b43_nphy_cal_radio_reg(unsigned int index)
 	return index < 26 ? 0x170 + (index / 13) * 0x20 + index % 13 : tail[index - 26];
 }
 
+/* A skipped calibration runs again at the next 15 s periodic work. */
+static void b43_nphy_cal_skipped(struct b43_wldev *dev)
+{
+	dev->phy.n->cal_time = jiffies - 120 * HZ;
+}
+
+/* Checks that the PHY is idle and saves the radio registers that a failed
+ * calibration restores. Returns 1 if the PHY was busy.
+ */
+static int b43_nphy_cal_admit(struct b43_wldev *dev)
+{
+	struct b43_phy_n *nphy = dev->phy.n;
+	struct b43_nphy_calibration *cal = nphy->calibration;
+	unsigned int i;
+
+	memset(cal, 0, sizeof(*cal));
+	cal->stage = "admission";
+	nphy->cal_time = jiffies;
+	if (!b43_nphy_cal_accessible(dev))
+		return -EIO;
+	for (i = 0; i < ARRAY_SIZE(cal->radio); i++)
+		cal->radio[i] = b43_radio_read(dev, b43_nphy_cal_radio_reg(i));
+	cal->radio_saved = true;
+	if ((b43_phy_read(dev, B43_NPHY_TXPCTL_CMD) & 0xe000) ||
+	    cal->radio[27] || cal->radio[30]) {
+		/* Nothing was written yet: keep the PHY setup and run without
+		 * these corrections, as before they existed. */
+		b43_nphy_cal_skipped(dev);
+		b43warn(dev->wl,
+			"N-PHY busy (TX power control %04x, radio %04x/%04x); calibration skipped\n",
+			b43_phy_read(dev, B43_NPHY_TXPCTL_CMD),
+			cal->radio[27], cal->radio[30]);
+		return 1;
+	}
+	return 0;
+}
+
+/* Runs one phase, or all of them for B43_NPHY_CAL_ALL, with the MAC
+ * suspended and TX power control off. Returns 1 if the PHY was busy and the
+ * calibration was skipped.
+ */
+static int b43_nphy_cal_run(struct b43_wldev *dev,
+			    enum b43_nphy_cal_phase phase)
+{
+	struct b43_nphy_calibration *cal = dev->phy.n->calibration;
+	bool all = phase == B43_NPHY_CAL_ALL;
+	int err;
+
+	if (all || phase == B43_NPHY_CAL_TX) {
+		err = b43_nphy_cal_admit(dev);
+		if (err)
+			return err;
+	} else {
+		cal->stage = "admission";
+	}
+	err = b43_nphy_cal_engine_enter(dev, &cal->engine);
+	if (err == -EBUSY && !cal->engine.entered) {
+		/* Its checks only read state too. */
+		b43_nphy_cal_skipped(dev);
+		b43warn(dev->wl, "N-PHY busy (MAC control %08x, IRQ %08x); calibration skipped\n",
+			b43_read32(dev, B43_MMIO_MACCTL),
+			b43_read32(dev, B43_MMIO_GEN_IRQ_REASON));
+		return 1;
+	}
+	if (err)
+		return err;
+	if (all || phase == B43_NPHY_CAL_TX) {
+		cal->stage = "TX IQ/LO";
+		err = b43_nphy_cal_tx(dev, &cal->engine, &cal->tx);
+		if (err)
+			return err;
+	}
+	if (all || phase == B43_NPHY_CAL_PAPD) {
+		cal->stage = "PAPD";
+		err = b43_nphy_cal_papd(dev, &cal->engine, &cal->papd);
+		if (err)
+			return err;
+	}
+	if (all || phase == B43_NPHY_CAL_RX) {
+		cal->stage = "RX IQ";
+		err = b43_nphy_cal_rx(dev, &cal->engine, &cal->rx);
+		if (err)
+			return err;
+	}
+	cal->stage = "release";
+	err = b43_nphy_cal_engine_leave(dev, &cal->engine);
+	if (err)
+		return err;
+	if (!all && phase != B43_NPHY_CAL_RX)
+		return 0;
+	b43_nphy_save_cal(dev);
+	cal->valid = true;
+	cal->stage = "complete";
+	return 0;
+}
+
+static bool b43_nphy_cal_qualified(struct b43_wldev *dev)
+{
+	return b43_nphy_2057_rev9_2g(dev) && dev->phy.n->ipa2g_on &&
+		dev->phy.chandef && (dev->phy.chandef->width == NL80211_CHAN_WIDTH_20 ||
+				     dev->phy.chandef->width == NL80211_CHAN_WIDTH_20_NOHT);
+}
+
 /* Runs in the core initialization, before DMA and interrupts are on. */
 static int b43_nphy_calibrate_initial(struct b43_wldev *dev)
 {
@@ -7327,68 +7430,17 @@ static int b43_nphy_calibrate_initial(struct b43_wldev *dev)
 	int err;
 
 	lockdep_assert_held(&dev->wl->mutex);
-	if (b43_status(dev) != B43_STAT_UNINIT ||
-	    !b43_nphy_2057_rev9_2g(dev) || !nphy->ipa2g_on ||
-	    !dev->phy.chandef || (dev->phy.chandef->width != NL80211_CHAN_WIDTH_20 &&
-				 dev->phy.chandef->width != NL80211_CHAN_WIDTH_20_NOHT))
+	if (b43_status(dev) != B43_STAT_UNINIT || !b43_nphy_cal_qualified(dev))
 		return -EOPNOTSUPP;
 	if (!cal) {
-		cal = kzalloc(sizeof(*cal), GFP_KERNEL);
+		cal = kzalloc_obj(*cal);
 		if (!cal)
 			return -ENOMEM;
 		nphy->calibration = cal;
-	} else {
-		memset(cal, 0, sizeof(*cal));
 	}
-	cal->stage = "admission";
-	if (!b43_nphy_cal_accessible(dev)) {
-		err = -EIO;
-		goto abort;
-	}
-	for (i = 0; i < ARRAY_SIZE(cal->radio); i++)
-		cal->radio[i] = b43_radio_read(dev, b43_nphy_cal_radio_reg(i));
-	cal->radio_saved = true;
-	if ((b43_phy_read(dev, B43_NPHY_TXPCTL_CMD) & 0xe000) ||
-	    cal->radio[27] || cal->radio[30]) {
-		/* Nothing was written yet: keep the PHY setup and run without
-		 * these corrections, as before they existed. */
-		b43warn(dev->wl, "N-PHY busy (TX power control %04x, radio %04x/%04x); initial calibration skipped\n",
-			b43_phy_read(dev, B43_NPHY_TXPCTL_CMD),
-			cal->radio[27], cal->radio[30]);
+	err = b43_nphy_cal_run(dev, B43_NPHY_CAL_ALL);
+	if (err >= 0)
 		return 0;
-	}
-	err = b43_nphy_cal_engine_enter(dev, &cal->engine);
-	if (err == -EBUSY && !cal->engine.entered) {
-		/* Its checks only read state too. */
-		b43warn(dev->wl, "N-PHY busy (MAC control %08x, IRQ %08x); initial calibration skipped\n",
-			b43_read32(dev, B43_MMIO_MACCTL),
-			b43_read32(dev, B43_MMIO_GEN_IRQ_REASON));
-		return 0;
-	}
-	if (err)
-		goto abort;
-	cal->stage = "TX IQ/LO";
-	err = b43_nphy_cal_tx(dev, &cal->engine, &cal->tx);
-	if (err)
-		goto abort;
-	cal->stage = "PAPD";
-	err = b43_nphy_cal_papd(dev, &cal->engine, &cal->papd);
-	if (err)
-		goto abort;
-	cal->stage = "RX IQ";
-	err = b43_nphy_cal_rx(dev, &cal->engine, &cal->rx);
-	if (err)
-		goto abort;
-	cal->stage = "release";
-	err = b43_nphy_cal_engine_leave(dev, &cal->engine);
-	if (err)
-		goto abort;
-	b43_nphy_save_cal(dev);
-	cal->valid = true;
-	cal->stage = "complete";
-	return 0;
-
-abort:
 	nphy->txiqlocal_coeffsvalid = false;
 	nphy->iqcal_chanspec_2G.center_freq = 0;
 	b43err(dev->wl, "Initial N-PHY calibration failed at %s: %d\n", cal->stage, err);
@@ -7397,6 +7449,88 @@ abort:
 		for (i = 0; i < ARRAY_SIZE(cal->radio); i++)
 			b43_radio_write(dev, b43_nphy_cal_radio_reg(i), cal->radio[i]);
 	return err;
+}
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/PericalRun */
+static void b43_nphy_recalibrate(struct b43_wldev *dev,
+				 enum b43_nphy_cal_phase phase)
+{
+	struct b43_phy_n *nphy = dev->phy.n;
+	struct b43_nphy_calibration *cal = nphy->calibration;
+	bool tx_pwr_state = nphy->txpwrctrl;
+	unsigned int i;
+	int err;
+
+	nphy->cal_phase = B43_NPHY_CAL_ALL;
+	/* Keep the peers from sending meanwhile: when it suspends the MAC,
+	 * the microcode sends a CTS with this duration and clears it. After a
+	 * channel change, the MAC is already suspended. Send none before TX
+	 * IQ/LO alone, so that the peers' frames get through when the MAC
+	 * runs after it.
+	 */
+	if (phase != B43_NPHY_CAL_TX && !dev->mac_suspended &&
+	    dev->wl->operating &&
+	    !(dev->phy.chandef->chan->flags & IEEE80211_CHAN_NO_IR))
+		b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_CTSDUR,
+				phase == B43_NPHY_CAL_RX ? 10000 : 31000);
+	b43_mac_suspend(dev);
+	b43_nphy_tx_power_ctrl(dev, false);
+	err = b43_nphy_cal_run(dev, phase);
+	b43_nphy_tx_pwr_ctrl_coef_setup(dev);
+	b43_nphy_tx_power_ctrl(dev, tx_pwr_state);
+	b43_mac_enable(dev);
+	if (!err && phase != B43_NPHY_CAL_ALL && phase != B43_NPHY_CAL_RX) {
+		nphy->cal_phase = phase + 1;
+		ieee80211_queue_delayed_work(dev->wl->hw, &nphy->cal_work,
+					     msecs_to_jiffies(5));
+	}
+	if (err >= 0)
+		return;
+	b43err(dev->wl, "N-PHY calibration failed at %s: %d\n", cal->stage, err);
+	/* A core reset does not reset these. */
+	if (cal->radio_saved)
+		for (i = 0; i < ARRAY_SIZE(cal->radio); i++)
+			b43_radio_write(dev, b43_nphy_cal_radio_reg(i), cal->radio[i]);
+	b43_controller_restart(dev, "N-PHY calibration failed");
+}
+
+static bool b43_nphy_cal_runnable(struct b43_wldev *dev)
+{
+	struct b43_nphy_calibration *cal = dev->phy.n->calibration;
+
+	return cal && b43_status(dev) == B43_STAT_STARTED &&
+		!(dev->wl->hw->conf.flags & IEEE80211_CONF_OFFCHANNEL) &&
+		b43_nphy_cal_qualified(dev);
+}
+
+static void b43_nphy_cal_work(struct work_struct *work)
+{
+	struct b43_phy_n *nphy = container_of(work, struct b43_phy_n,
+					      cal_work.work);
+	struct b43_wldev *dev = nphy->dev;
+	struct b43_chanspec *cal = &nphy->txiqlocal_chanspec;
+
+	mutex_lock(&dev->wl->mutex);
+	if (nphy->cal_phase == B43_NPHY_CAL_ALL)
+		goto out;
+	/* The channel changed since the TX IQ/LO phase: start again at the
+	 * next periodic work.
+	 */
+	if (!b43_nphy_cal_runnable(dev) ||
+	    cal->center_freq != dev->phy.chandef->chan->center_freq ||
+	    cal->channel_type != cfg80211_get_chandef_type(dev->phy.chandef)) {
+		nphy->cal_phase = B43_NPHY_CAL_ALL;
+		b43_nphy_cal_skipped(dev);
+		goto out;
+	}
+	b43_nphy_recalibrate(dev, nphy->cal_phase);
+out:
+	mutex_unlock(&dev->wl->mutex);
+}
+
+void b43_nphy_cancel_calibration(struct b43_wldev *dev)
+{
+	cancel_delayed_work_sync(&dev->phy.n->cal_work);
 }
 
 /**************************************************
@@ -7679,7 +7813,7 @@ static int b43_phy_initn(struct b43_wldev *dev)
 					if (b43_nphy_cal_rx_iq(dev, target, 2, 0) == 0)
 						b43_nphy_save_cal(dev);
 			} else if (nphy->mphase_cal_phase_id == 0) {
-				if (b43_nphy_2057_rev9_2g(dev) && nphy->ipa2g_on &&
+				if (b43_nphy_cal_qualified(dev) &&
 				    b43_status(dev) == B43_STAT_UNINIT) {
 					err = b43_nphy_calibrate_initial(dev);
 					if (err)
@@ -7955,6 +8089,8 @@ static void b43_nphy_op_prepare_structs(struct b43_wldev *dev)
 
 	memset(nphy, 0, sizeof(*nphy));
 	nphy->calibration = calibration;
+	nphy->dev = dev;
+	INIT_DELAYED_WORK(&nphy->cal_work, b43_nphy_cal_work);
 
 	nphy->hang_avoid = (phy->rev == 3 || phy->rev == 4);
 	nphy->spur_avoid = (phy->rev >= 3) ?
@@ -8164,6 +8300,20 @@ static int b43_nphy_op_switch_channel(struct b43_wldev *dev,
 	return b43_nphy_set_channel(dev, channel, channel_type);
 }
 
+static void b43_nphy_op_calibrate(struct b43_wldev *dev)
+{
+	if (b43_nphy_cal_runnable(dev) &&
+	    dev->phy.n->txiqlocal_chanspec.center_freq != dev->phy.chandef->chan->center_freq)
+		b43_nphy_recalibrate(dev, B43_NPHY_CAL_ALL);
+}
+
+static void b43_nphy_op_pwork_15sec(struct b43_wldev *dev)
+{
+	if (b43_nphy_cal_runnable(dev) &&
+	    time_after_eq(jiffies, dev->phy.n->cal_time + 120 * HZ))
+		b43_nphy_recalibrate(dev, B43_NPHY_CAL_TX);
+}
+
 static unsigned int b43_nphy_op_get_default_chan(struct b43_wldev *dev)
 {
 	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ)
@@ -8184,4 +8334,6 @@ const struct b43_phy_operations b43_phyops_n = {
 	.switch_channel		= b43_nphy_op_switch_channel,
 	.get_default_chan	= b43_nphy_op_get_default_chan,
 	.recalc_txpower		= b43_nphy_op_recalc_txpower,
+	.calibrate		= b43_nphy_op_calibrate,
+	.pwork_15sec		= b43_nphy_op_pwork_15sec,
 };
