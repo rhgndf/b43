@@ -575,7 +575,10 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 			memcpy(txhdr->iv, ((u8 *) wlhdr) + wlhdr_len, iv_len);
 		}
 	}
-	if (ht && !ieee80211_is_ctl(fctl)) {
+	/* mac80211 leaves the duration to the driver for HT rates and for
+	 * frames sent through fast-xmit. */
+	if ((ht || info->control.flags & IEEE80211_TX_CTRL_FAST_XMIT) &&
+	    !ieee80211_is_ctl(fctl)) {
 		/* mac80211 does not export the next fragment's length. Reserve
 		 * one full-sized fragment, an upper bound for the final one. */
 		if (ieee80211_has_morefrags(fctl))

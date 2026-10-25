@@ -6337,6 +6337,8 @@ static int b43_setup_bands(struct b43_wldev *dev,
 		hw->wiphy->available_antennas_tx = 0x3;
 		hw->wiphy->available_antennas_rx = 0x3;
 		ieee80211_hw_set(hw, AMPDU_AGGREGATION);
+		ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
+		ieee80211_hw_set(hw, TX_AMSDU);
 		hw->max_rx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF_HT;
 		hw->max_tx_aggregation_subframes = B43_AMPDU_TX_WINDOW;
 		hw->wiphy->bands[NL80211_BAND_2GHZ] = &dev->band_2ghz_ht;
