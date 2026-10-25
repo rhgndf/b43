@@ -3180,6 +3180,18 @@ static void b43_nphy_workarounds_rev7plus(struct b43_wldev *dev)
 
 	b43_nphy_gain_ctl_workarounds(dev);
 
+	/* Auxiliary ADC VMID and gain. Without entry 3, STBC frames at 40 MHz
+	 * are received worse than others. */
+	if (b43_nphy_2057_rev9_2g(dev)) {
+		static const u16 vmid0[] = { 0x86, 0xb4, 0xb4, 0x88 };
+		static const u16 vmid1[] = { 0x90, 0xb4, 0xb4, 0x8c };
+		static const u16 gain[] = { 2, 2, 2, 0 };
+
+		b43_ntab_write_bulk(dev, B43_NTAB16(8, 0x08), 4, vmid0);
+		b43_ntab_write_bulk(dev, B43_NTAB16(8, 0x18), 4, vmid1);
+		b43_ntab_write_bulk(dev, B43_NTAB16(8, 0x0C), 4, gain);
+		b43_ntab_write_bulk(dev, B43_NTAB16(8, 0x1C), 4, gain);
+	}
 	/* TODO
 	b43_ntab_write_bulk(dev, B43_NTAB16(8, 0x08), 4,
 			    aux_adc_vmid_rev7_core0);
