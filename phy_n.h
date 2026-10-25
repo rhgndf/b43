@@ -931,6 +931,8 @@ struct b43_phy_n_pwr_ctl_info {
 	u8 idle_tssi_5g;
 };
 
+struct b43_nphy_calibration;
+
 struct b43_phy_n {
 	u8 antsel_type;
 	u8 cal_orig_pwr_idx[2];
@@ -999,6 +1001,7 @@ struct b43_phy_n {
 	struct b43_phy_n_cal_cache cal_cache;
 	bool crsminpwr_adjusted;
 	bool noisevars_adjusted;
+	struct b43_nphy_calibration *calibration;
 };
 
 

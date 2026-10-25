@@ -12,6 +12,9 @@
 
 #include <linux/cordic.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
+#include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
@@ -5961,6 +5964,1436 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 	return B43_TXPWR_RES_DONE;
 }
 
+/* PHY state that a calibration saves on entry and restores on leaving */
+#define B43_NPHY_CAL_SAMPLES 160
+
+struct b43_nphy_cal_engine {
+	u32 clock_ctl;
+	u32 bb_mult_save;
+	u16 bbcfg, classifier, clip[2], table_addr;
+	u16 sample_cmd, sample_depth, sample_loops, sample_wait;
+	u16 rfseq_mode, estimate_cmd, estimate_wait, estimate_samples;
+	u16 classifier_state, clip_state[2];
+	unsigned int deaf_count;
+	bool hang_avoid, lpf_override;
+	bool entered, sample_owned, estimator_owned;
+};
+
+static bool b43_nphy_cal_accessible(struct b43_wldev *dev)
+{
+#ifdef CONFIG_B43_BCMA
+	u32 ctl, reset;
+
+	if (dev->dev->bus_type != B43_BUS_BCMA)
+		return false;
+	ctl = bcma_aread32(dev->dev->bdev, BCMA_IOCTL);
+	reset = bcma_aread32(dev->dev->bdev, BCMA_RESET_CTL);
+	return ctl != ~0U && reset != ~0U &&
+		(ctl & BCMA_IOCTL_CLK) && (ctl & B43_BCMA_IOCTL_PHY_CLKEN) &&
+		!(ctl & B43_BCMA_IOCTL_PHY_RESET) && !(reset & BCMA_RESET_CTL_RESET);
+#else
+	return false;
+#endif
+}
+
+static bool b43_nphy_cal_idle(struct b43_wldev *dev)
+{
+	return b43_nphy_cal_accessible(dev) &&
+		!(b43_phy_read(dev, B43_NPHY_SAMP_CMD) & 7) &&
+		!(b43_phy_read(dev, B43_NPHY_SAMP_STAT) & 3) &&
+		!(b43_phy_read(dev, B43_NPHY_IQLOCAL_CMDGCTL) & 0x8000) &&
+		!(b43_phy_read(dev, B43_NPHY_IQLOCAL_CMD) & 0xc000) &&
+		!(b43_phy_read(dev, B43_NPHY_IQEST_CMD) & B43_NPHY_IQEST_CMD_START) &&
+		!(b43_phy_read(dev, B43_NPHY_RFSEQTR) & 0x3f) &&
+		!(b43_phy_read(dev, B43_NPHY_RFSEQST) & 0x3f) &&
+		!b43_phy_read(dev, 0x2be) && !(b43_phy_read(dev, 0x2ff) & 1);
+}
+
+static bool b43_nphy_cal_rfseq_done(struct b43_wldev *dev)
+{
+	return !(b43_phy_read(dev, B43_NPHY_RFSEQST) & 0x3f) &&
+	       !(b43_phy_read(dev, B43_NPHY_RFSEQTR) & 0x3f);
+}
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/ForceRFSeq */
+static int b43_nphy_cal_rfseq(struct b43_wldev *dev,
+			     enum b43_nphy_rf_sequence sequence)
+{
+	static const u16 triggers[] = {
+		[B43_RFSEQ_RX2TX] = B43_NPHY_RFSEQTR_RX2TX,
+		[B43_RFSEQ_TX2RX] = B43_NPHY_RFSEQTR_TX2RX,
+		[B43_RFSEQ_RESET2RX] = B43_NPHY_RFSEQTR_RST2RX,
+		[B43_RFSEQ_UPDATE_GAINH] = B43_NPHY_RFSEQTR_UPGH,
+		[B43_RFSEQ_UPDATE_GAINL] = B43_NPHY_RFSEQTR_UPGL,
+		[B43_RFSEQ_UPDATE_GAINU] = B43_NPHY_RFSEQTR_UPGU,
+	};
+	u16 mode, trigger;
+	bool done;
+	int err;
+
+	if ((unsigned int)sequence >= ARRAY_SIZE(triggers))
+		return -EINVAL;
+	mode = b43_phy_read(dev, B43_NPHY_RFSEQMODE);
+	trigger = b43_phy_read(dev, B43_NPHY_RFSEQTR);
+	if ((trigger & 0x3f) || (b43_phy_read(dev, B43_NPHY_RFSEQST) & 0x3f))
+		return -EBUSY;
+	b43_phy_write(dev, B43_NPHY_RFSEQMODE, mode |
+		B43_NPHY_RFSEQMODE_CAOVER | B43_NPHY_RFSEQMODE_TROVER);
+	b43_phy_write(dev, B43_NPHY_RFSEQTR, trigger | triggers[sequence]);
+	err = poll_timeout_us(done = b43_nphy_cal_rfseq_done(dev), done,
+			      1100, 200 * USEC_PER_MSEC, false);
+	if (err)
+		return err;
+	b43_phy_write(dev, B43_NPHY_RFSEQMODE, mode);
+	return 0;
+}
+
+static int b43_nphy_cal_engine_enter(struct b43_wldev *dev,
+				      struct b43_nphy_cal_engine *e)
+{
+	struct b43_phy_n *nphy = dev->phy.n;
+	u32 mac, irq;
+
+	lockdep_assert_held(&dev->wl->mutex);
+	mac = b43_read32(dev, B43_MMIO_MACCTL);
+	irq = b43_read32(dev, B43_MMIO_GEN_IRQ_REASON);
+	if (e->entered || !b43_nphy_cal_idle(dev) || dev->mac_suspended <= 0 ||
+	    mac == ~0U || irq == ~0U || (mac & B43_MACCTL_ENABLED) ||
+	    !(irq & B43_IRQ_MAC_SUSPENDED) || nphy->deaf_count ||
+	    (nphy->bb_mult_save & 0x80000000) || nphy->lpf_bw_overrode_for_sample_play)
+		return -EBUSY;
+	e->bbcfg = b43_phy_read(dev, B43_NPHY_BBCFG);
+	if (e->bbcfg & (B43_NPHY_BBCFG_RSTCCA | B43_NPHY_BBCFG_RSTRX))
+		return -EBUSY;
+	e->classifier = b43_phy_read(dev, B43_NPHY_CLASSCTL);
+	e->clip[0] = b43_phy_read(dev, B43_NPHY_C1_CLIP1THRES);
+	e->clip[1] = b43_phy_read(dev, B43_NPHY_C2_CLIP1THRES);
+	e->table_addr = b43_phy_read(dev, B43_NPHY_TABLE_ADDR);
+	e->sample_cmd = b43_phy_read(dev, B43_NPHY_SAMP_CMD);
+	e->sample_depth = b43_phy_read(dev, B43_NPHY_SAMP_DEPCNT);
+	e->sample_loops = b43_phy_read(dev, B43_NPHY_SAMP_LOOPCNT);
+	e->sample_wait = b43_phy_read(dev, B43_NPHY_SAMP_WAITCNT);
+	e->rfseq_mode = b43_phy_read(dev, B43_NPHY_RFSEQMODE);
+	e->estimate_cmd = b43_phy_read(dev, B43_NPHY_IQEST_CMD);
+	e->estimate_wait = b43_phy_read(dev, B43_NPHY_IQEST_WT);
+	e->estimate_samples = b43_phy_read(dev, B43_NPHY_IQEST_SAMCNT);
+	e->deaf_count = nphy->deaf_count;
+	e->bb_mult_save = nphy->bb_mult_save;
+	e->classifier_state = nphy->classifier_state;
+	e->clip_state[0] = nphy->clip_state[0];
+	e->clip_state[1] = nphy->clip_state[1];
+	e->hang_avoid = nphy->hang_avoid;
+	e->lpf_override = nphy->lpf_bw_overrode_for_sample_play;
+#ifdef CONFIG_B43_BCMA
+	e->clock_ctl = bcma_aread32(dev->dev->bdev, BCMA_IOCTL);
+	e->entered = true;
+	bcma_awrite32(dev->dev->bdev, BCMA_IOCTL, e->clock_ctl | BCMA_IOCTL_FGC);
+	if (bcma_aread32(dev->dev->bdev, BCMA_IOCTL) != (e->clock_ctl | BCMA_IOCTL_FGC))
+		return -EIO;
+#else
+	return -EOPNOTSUPP;
+#endif
+	b43_phy_write(dev, B43_NPHY_CLASSCTL,
+		(e->classifier & ~7) | B43_NPHY_CLASSCTL_WAITEDEN);
+	b43_phy_write(dev, B43_NPHY_C1_CLIP1THRES, 0xffff);
+	b43_phy_write(dev, B43_NPHY_C2_CLIP1THRES, 0xffff);
+	b43_phy_write(dev, B43_NPHY_BBCFG, e->bbcfg | B43_NPHY_BBCFG_RSTCCA);
+	udelay(1);
+	b43_phy_write(dev, B43_NPHY_BBCFG, e->bbcfg);
+	return b43_nphy_cal_rfseq(dev, B43_RFSEQ_RESET2RX);
+}
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/GenLoadSamples */
+static int b43_nphy_cal_engine_load_wave(struct b43_wldev *dev,
+					  struct b43_nphy_cal_engine *e,
+					  unsigned int khz, unsigned int amplitude)
+{
+	if (!e->entered || e->sample_owned || e->estimator_owned ||
+	    !b43_nphy_cal_idle(dev))
+		return -EBUSY;
+	if (!b43_nphy_gen_load_samples(dev, khz, amplitude, false))
+		return -ENOMEM;
+	return 0;
+}
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/RunSamples */
+static int b43_nphy_cal_engine_start(struct b43_wldev *dev,
+				      struct b43_nphy_cal_engine *e)
+{
+	u16 mode, stat;
+	int err;
+
+	if (!e->entered || e->sample_owned || e->estimator_owned ||
+	    !b43_nphy_cal_idle(dev))
+		return -EBUSY;
+	if (!(b43_phy_read(dev, B43_NPHY_REV7_RF_CTL_OVER3) & 0x80) ||
+	    !(b43_phy_read(dev, B43_NPHY_REV7_RF_CTL_OVER4) & 0x80))
+		return -EINVAL;
+	mode = b43_phy_read(dev, B43_NPHY_RFSEQMODE);
+	e->sample_owned = true;
+	b43_phy_write(dev, B43_NPHY_SAMP_DEPCNT, B43_NPHY_CAL_SAMPLES - 1);
+	b43_phy_write(dev, B43_NPHY_SAMP_LOOPCNT, 0xffff);
+	b43_phy_write(dev, B43_NPHY_SAMP_WAITCNT, 0);
+	b43_phy_write(dev, B43_NPHY_RFSEQMODE, mode | B43_NPHY_RFSEQMODE_CAOVER);
+	b43_phy_write(dev, B43_NPHY_SAMP_CMD, e->sample_cmd | 1);
+	err = read_poll_timeout_atomic(b43_phy_read, stat,
+				       (stat & 3) == 1 &&
+				       !(b43_phy_read(dev, B43_NPHY_RFSEQST) & 0x3f),
+				       10, 1000, false, dev, B43_NPHY_SAMP_STAT);
+	if (err)
+		return err;
+	b43_phy_write(dev, B43_NPHY_RFSEQMODE, mode);
+	return 0;
+}
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/RxIqEst */
+static int b43_nphy_cal_engine_measure(struct b43_wldev *dev,
+					struct b43_nphy_cal_engine *e,
+					u16 samples, struct nphy_iq_est *estimate)
+{
+	u16 command;
+	int err;
+
+	if (!e->entered || !e->sample_owned || e->estimator_owned || !samples ||
+	    (b43_phy_read(dev, B43_NPHY_SAMP_STAT) & 3) != 1 ||
+	    (b43_phy_read(dev, B43_NPHY_IQEST_CMD) & B43_NPHY_IQEST_CMD_START) ||
+	    (b43_phy_read(dev, B43_NPHY_IQLOCAL_CMDGCTL) & 0x8000) ||
+	    (b43_phy_read(dev, B43_NPHY_IQLOCAL_CMD) & 0xc000) ||
+	    ((b43_phy_read(dev, B43_NPHY_RFSEQTR) |
+	      b43_phy_read(dev, B43_NPHY_RFSEQST)) & 0x3f) || b43_phy_read(dev, 0x2be))
+		return -EBUSY;
+	command = e->estimate_cmd & ~B43_NPHY_IQEST_CMD_MODE;
+	e->estimator_owned = true;
+	b43_phy_write(dev, B43_NPHY_IQEST_SAMCNT, samples);
+	b43_phy_write(dev, B43_NPHY_IQEST_WT, (e->estimate_wait & ~B43_NPHY_IQEST_WT_VAL) | 32);
+	b43_phy_write(dev, B43_NPHY_IQEST_CMD, command);
+	b43_phy_write(dev, B43_NPHY_IQEST_CMD, command | B43_NPHY_IQEST_CMD_START);
+	err = read_poll_timeout_atomic(b43_phy_read, command,
+				       !(command & B43_NPHY_IQEST_CMD_START), 10,
+				       10000, false, dev, B43_NPHY_IQEST_CMD);
+	if (err)
+		return err;
+	e->estimator_owned = false;
+	estimate->i0_pwr = ((u32)b43_phy_read(dev, B43_NPHY_IQEST_IPACC_HI0) << 16) |
+		b43_phy_read(dev, B43_NPHY_IQEST_IPACC_LO0);
+	estimate->q0_pwr = ((u32)b43_phy_read(dev, B43_NPHY_IQEST_QPACC_HI0) << 16) |
+		b43_phy_read(dev, B43_NPHY_IQEST_QPACC_LO0);
+	estimate->iq0_prod = (s32)(((u32)b43_phy_read(dev, B43_NPHY_IQEST_IQACC_HI0) << 16) |
+		b43_phy_read(dev, B43_NPHY_IQEST_IQACC_LO0));
+	estimate->i1_pwr = ((u32)b43_phy_read(dev, B43_NPHY_IQEST_IPACC_HI1) << 16) |
+		b43_phy_read(dev, B43_NPHY_IQEST_IPACC_LO1);
+	estimate->q1_pwr = ((u32)b43_phy_read(dev, B43_NPHY_IQEST_QPACC_HI1) << 16) |
+		b43_phy_read(dev, B43_NPHY_IQEST_QPACC_LO1);
+	estimate->iq1_prod = (s32)(((u32)b43_phy_read(dev, B43_NPHY_IQEST_IQACC_HI1) << 16) |
+		b43_phy_read(dev, B43_NPHY_IQEST_IQACC_LO1));
+	return 0;
+}
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/stop-playback */
+static int b43_nphy_cal_engine_stop(struct b43_wldev *dev,
+				     struct b43_nphy_cal_engine *e)
+{
+	u16 stat;
+	int err;
+
+	if (!e->entered || e->estimator_owned || !b43_nphy_cal_accessible(dev) ||
+	    (b43_phy_read(dev, B43_NPHY_IQEST_CMD) & B43_NPHY_IQEST_CMD_START) ||
+	    (b43_phy_read(dev, B43_NPHY_IQLOCAL_CMDGCTL) & 0x8000) ||
+	    (b43_phy_read(dev, B43_NPHY_IQLOCAL_CMD) & 0xc000) || b43_phy_read(dev, 0x2be))
+		return -EBUSY;
+	if (!e->sample_owned)
+		return b43_nphy_cal_idle(dev) ? 0 : -EBUSY;
+	b43_phy_write(dev, B43_NPHY_SAMP_CMD, e->sample_cmd | B43_NPHY_SAMP_CMD_STOP);
+	err = read_poll_timeout_atomic(b43_phy_read, stat,
+				       !(stat & 3) && b43_nphy_cal_rfseq_done(dev),
+				       10, 10000, false, dev, B43_NPHY_SAMP_STAT);
+	if (err)
+		return err;
+	b43_phy_write(dev, B43_NPHY_SAMP_CMD, e->sample_cmd);
+	if (!b43_nphy_cal_idle(dev))
+		return -EIO;
+	e->sample_owned = false;
+	return 0;
+}
+
+static int b43_nphy_cal_engine_leave(struct b43_wldev *dev,
+				      struct b43_nphy_cal_engine *e)
+{
+	struct b43_phy_n *nphy = dev->phy.n;
+
+	if (!e->entered || e->sample_owned || e->estimator_owned ||
+	    !b43_nphy_cal_idle(dev) || nphy->deaf_count != e->deaf_count ||
+	    nphy->bb_mult_save != e->bb_mult_save || nphy->hang_avoid != e->hang_avoid ||
+	    nphy->lpf_bw_overrode_for_sample_play != e->lpf_override ||
+	    nphy->classifier_state != e->classifier_state ||
+	    nphy->clip_state[0] != e->clip_state[0] || nphy->clip_state[1] != e->clip_state[1])
+		return -EBUSY;
+	b43_phy_write(dev, B43_NPHY_SAMP_DEPCNT, e->sample_depth);
+	b43_phy_write(dev, B43_NPHY_SAMP_LOOPCNT, e->sample_loops);
+	b43_phy_write(dev, B43_NPHY_SAMP_WAITCNT, e->sample_wait);
+	b43_phy_write(dev, B43_NPHY_IQEST_SAMCNT, e->estimate_samples);
+	b43_phy_write(dev, B43_NPHY_IQEST_WT, e->estimate_wait);
+	b43_phy_write(dev, B43_NPHY_IQEST_CMD, e->estimate_cmd);
+	b43_phy_write(dev, B43_NPHY_RFSEQMODE, e->rfseq_mode);
+	b43_phy_write(dev, B43_NPHY_BBCFG, e->bbcfg);
+	b43_phy_write(dev, B43_NPHY_TABLE_ADDR, e->table_addr);
+	b43_phy_write(dev, B43_NPHY_C1_CLIP1THRES, e->clip[0]);
+	b43_phy_write(dev, B43_NPHY_C2_CLIP1THRES, e->clip[1]);
+	b43_phy_write(dev, B43_NPHY_CLASSCTL, e->classifier);
+#ifdef CONFIG_B43_BCMA
+	bcma_awrite32(dev->dev->bdev, BCMA_IOCTL, e->clock_ctl);
+	if (bcma_aread32(dev->dev->bdev, BCMA_IOCTL) != e->clock_ctl)
+		return -EIO;
+#endif
+	if (!b43_nphy_cal_idle(dev))
+		return -EIO;
+	e->entered = false;
+	return 0;
+}
+static const u16 b43_nphy_cal_tx_phy_regs[] = {
+	B43_NPHY_AFECTL_C1, B43_NPHY_AFECTL_C2,
+	B43_NPHY_AFECTL_OVER1, B43_NPHY_AFECTL_OVER,
+	B43_NPHY_BBCFG, B43_NPHY_RFCTL_INTC1, B43_NPHY_RFCTL_INTC2,
+	B43_NPHY_PAPD_EN0, B43_NPHY_PAPD_EN1,
+	0x340, 0x341, 0x342, 0x343, 0x07a, 0x07d, 0x0e7, 0x0ec, 0x2ff,
+};
+
+struct b43_nphy_tx_cal {
+	u16 phy[ARRAY_SIZE(b43_nphy_cal_tx_phy_regs)];
+	u16 radio[2][8];
+	u16 table8[2], gains[2], bbmult[2];
+	u16 result[11], nnum, generator, ladder_bbmult;
+	bool internal, attempted, valid;
+	unsigned int completed_commands;
+};
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/CalTxIqlo */
+static int b43_nphy_cal_tx(struct b43_wldev *dev,
+			   struct b43_nphy_cal_engine *engine,
+			   struct b43_nphy_tx_cal *cal)
+{
+	struct b43_phy_n *nphy = dev->phy.n;
+	struct nphy_txgains target = {
+		.tx_lpf = { 0, 0 }, .txgm = { 6, 6 }, .pga = { 0, 0 },
+		.pad = { 12, 12 }, .ipa = { 7, 7 },
+	};
+	struct nphy_iqcal_params params[2];
+	u16 gain[2], command, status, core, type;
+	unsigned int i, j, count;
+	bool ladder_updated[2] = { };
+	bool idle;
+	int err;
+
+	if (cal->attempted || !engine->entered || !b43_nphy_cal_idle(dev) ||
+	    (b43_phy_read(dev, B43_NPHY_TXPCTL_CMD) & 0xe000))
+		return -EBUSY;
+	cal->attempted = true;
+	for (i = 0; i < ARRAY_SIZE(cal->phy); i++)
+		cal->phy[i] = b43_phy_read(dev, b43_nphy_cal_tx_phy_regs[i]);
+	for (core = 0; core < 2; core++) {
+		for (i = 0; i < ARRAY_SIZE(cal->radio[core]); i++)
+			cal->radio[core][i] = b43_radio_read(dev, 0x175 + core * 0x20 + i);
+		cal->table8[core] = b43_ntab_read(dev, B43_NTAB16(8, core ? 19 : 3));
+		cal->bbmult[core] = b43_ntab_read(dev, B43_NTAB16(15, 87 + core * 8));
+		b43_nphy_iq_cal_gain_params(dev, core, target, &params[core]);
+		gain[core] = params[core].cal_gain;
+	}
+	b43_ntab_read_bulk(dev, B43_NTAB16(7, 0x110), 2, cal->gains);
+	cal->nnum = b43_phy_read(dev, B43_NPHY_IQLOCAL_CMDNNUM);
+	cal->generator = b43_phy_read(dev, B43_NPHY_IQLOCAL_CMDGCTL);
+	cal->ladder_bbmult = nphy->txcal_bbmult;
+	cal->internal = nphy->use_int_tx_iq_lo_cal;
+
+	/* Stimulus: baseband multiplier 0x4040 and the target gains */
+	nphy->use_int_tx_iq_lo_cal = true;
+	nphy->txcal_bbmult = 0x4040;
+	b43_ntab_write(dev, B43_NTAB16(15, 87), 0x4040);
+	b43_ntab_write_bulk(dev, B43_NTAB16(7, 0x110), 2, gain);
+	b43_nphy_tx_cal_radio_setup(dev);
+	b43_nphy_tx_cal_phy_setup(dev);
+	b43_ntab_write_bulk(dev, B43_NTAB16(15, 0), 18, tbl_tx_iqlo_cal_loft_ladder_20);
+	b43_ntab_write_bulk(dev, B43_NTAB16(15, 32), 18, tbl_tx_iqlo_cal_iqimb_ladder_20);
+	err = b43_nphy_cal_engine_load_wave(dev, engine, 2500, 250);
+	if (err)
+		return err;
+	b43_phy_write(dev, B43_NPHY_IQLOCAL_CMDGCTL, 0x8ad9);
+	b43_nphy_run_samples(dev, B43_NPHY_CAL_SAMPLES, 0xffff, 0, true, false, false);
+	err = read_poll_timeout_atomic(b43_phy_read, status,
+				       (status & 3) == 2 || (status & 1),
+				       10, 10000, false, dev, B43_NPHY_SAMP_STAT);
+	if (err)
+		return err;
+	if ((status & 3) != 2)
+		return -EBUSY;
+	if (((b43_phy_read(dev, B43_NPHY_RFSEQTR) |
+	      b43_phy_read(dev, B43_NPHY_RFSEQST)) & 0x3f) ||
+	    !(b43_phy_read(dev, B43_NPHY_IQLOCAL_CMDGCTL) & 0x8000))
+		return -EBUSY;
+	b43_ntab_write_bulk(dev, B43_NTAB16(15, 64),
+		B43_NTAB_TX_IQLO_CAL_STARTCOEFS_REV3, tbl_tx_iqlo_cal_startcoefs_nphyrev3);
+	for (count = 0; count < B43_NTAB_TX_IQLO_CAL_CMDS_FULLCAL_REV3; count++) {
+		command = tbl_tx_iqlo_cal_cmds_fullcal_nphyrev3[count];
+		core = (command >> 12) & 3;
+		type = (command >> 8) & 15;
+		if (!ladder_updated[core]) {
+			b43_nphy_update_tx_cal_ladder(dev, core);
+			ladder_updated[core] = true;
+		}
+		b43_phy_write(dev, B43_NPHY_IQLOCAL_CMDNNUM, (params[core].ncorr[type] << 8) | 0x66);
+		if (type == 1 || type == 3 || type == 4)
+			b43_ntab_write(dev, B43_NTAB16(15, 69 + core), 0);
+		if (b43_phy_read(dev, B43_NPHY_IQLOCAL_CMD) & 0xc000)
+			return -EBUSY;
+		b43_phy_write(dev, B43_NPHY_IQLOCAL_CMD, command);
+		err = read_poll_timeout_atomic(b43_phy_read, status,
+					       !(status & 0xc000), 10, 20000,
+					       false, dev, B43_NPHY_IQLOCAL_CMD);
+		if (err)
+			return err;
+		b43_ntab_read_bulk(dev, B43_NTAB16(15, 96), ARRAY_SIZE(cal->result), cal->result);
+		b43_ntab_write_bulk(dev, B43_NTAB16(15, 64), ARRAY_SIZE(cal->result), cal->result);
+		cal->completed_commands++;
+	}
+	/* Install the coefficients now: the cleanup below clears the results. */
+	b43_ntab_write_bulk(dev, B43_NTAB16(15, 80), 4, cal->result);
+	b43_ntab_write_bulk(dev, B43_NTAB16(15, 88), 4, cal->result);
+	b43_ntab_write_bulk(dev, B43_NTAB16(15, 85), 2, cal->result + 5);
+	b43_ntab_write_bulk(dev, B43_NTAB16(15, 93), 2, cal->result + 5);
+	b43_phy_mask(dev, B43_NPHY_IQLOCAL_CMDGCTL, 0x7fff);
+	err = read_poll_timeout_atomic(b43_nphy_cal_idle, idle, idle,
+				       10, 10000, false, dev);
+	if (err)
+		return err;
+	b43_nphy_stop_playback(dev);
+	b43_phy_write(dev, B43_NPHY_IQLOCAL_CMDGCTL, cal->generator);
+
+	/* Clear these override enables before restoring the values. */
+	b43_phy_mask(dev, 0x342, (u16)~0x80);
+	b43_phy_mask(dev, 0x343, (u16)~0x80);
+	b43_phy_mask(dev, 0x0e7, (u16)~8);
+	b43_phy_mask(dev, 0x0ec, (u16)~8);
+	b43_phy_mask(dev, B43_NPHY_AFECTL_OVER1, (u16)~0x0600);
+	b43_phy_mask(dev, B43_NPHY_AFECTL_OVER, (u16)~0x0600);
+	for (i = 0; i < ARRAY_SIZE(cal->phy); i++) {
+		if (i == 2 || i == 3 || i == 11 || i == 12 || i == 15 || i == 16)
+			continue;
+		b43_phy_write(dev, b43_nphy_cal_tx_phy_regs[i], cal->phy[i]);
+	}
+	for (core = 0; core < 2; core++) {
+		for (i = 0; i < ARRAY_SIZE(cal->radio[core]); i++)
+			b43_radio_write(dev, 0x175 + core * 0x20 + i, cal->radio[core][i]);
+		b43_ntab_write(dev, B43_NTAB16(8, core ? 19 : 3), cal->table8[core]);
+		b43_ntab_write(dev, B43_NTAB16(15, 87 + core * 8), cal->bbmult[core]);
+	}
+	b43_ntab_write_bulk(dev, B43_NTAB16(7, 0x110), 2, cal->gains);
+	b43_phy_write(dev, 0x342, cal->phy[11]);
+	b43_phy_write(dev, 0x343, cal->phy[12]);
+	b43_phy_write(dev, 0x0e7, cal->phy[15]);
+	b43_phy_write(dev, 0x0ec, cal->phy[16]);
+	b43_phy_write(dev, B43_NPHY_AFECTL_OVER1, cal->phy[2]);
+	b43_phy_write(dev, B43_NPHY_AFECTL_OVER, cal->phy[3]);
+	b43_phy_write(dev, B43_NPHY_IQLOCAL_CMDNNUM, cal->nnum);
+	b43_phy_write(dev, B43_NPHY_BBCFG, cal->phy[4] | B43_NPHY_BBCFG_RSTCCA);
+	udelay(1);
+	b43_phy_write(dev, B43_NPHY_BBCFG, cal->phy[4]);
+	err = b43_nphy_cal_rfseq(dev, B43_RFSEQ_RESET2RX);
+	if (err)
+		return err;
+	for (i = 0; i < ARRAY_SIZE(cal->phy); i++)
+		if (b43_phy_read(dev, b43_nphy_cal_tx_phy_regs[i]) != cal->phy[i])
+			return -EIO;
+	for (core = 0; core < 2; core++) {
+		for (i = 0; i < ARRAY_SIZE(cal->radio[core]); i++)
+			if (b43_radio_read(dev, 0x175 + core * 0x20 + i) != cal->radio[core][i])
+				return -EIO;
+		if (b43_ntab_read(dev, B43_NTAB16(8, core ? 19 : 3)) != cal->table8[core] ||
+		    b43_ntab_read(dev, B43_NTAB16(15, 87 + core * 8)) != cal->bbmult[core] ||
+		    b43_ntab_read(dev, B43_NTAB16(7, 0x110 + core)) != cal->gains[core])
+			return -EIO;
+	}
+	for (i = 0; i < 2; i++) {
+		for (j = 0; j < 4; j++)
+			if (b43_ntab_read(dev, B43_NTAB16(15, 80 + i * 8 + j)) != cal->result[j])
+				return -EIO;
+		for (j = 0; j < 2; j++)
+			if (b43_ntab_read(dev, B43_NTAB16(15, 85 + i * 8 + j)) != cal->result[5 + j])
+				return -EIO;
+	}
+	if (!b43_nphy_cal_idle(dev))
+		return -EBUSY;
+	nphy->classifier_state = engine->classifier_state;
+	memcpy(nphy->clip_state, engine->clip_state, sizeof(nphy->clip_state));
+	nphy->use_int_tx_iq_lo_cal = cal->internal;
+	nphy->txcal_bbmult = cal->ladder_bbmult;
+	memcpy(nphy->txiqlocal_bestc, cal->result, sizeof(cal->result));
+	nphy->txiqlocal_chanspec.center_freq = dev->phy.chandef->chan->center_freq;
+	nphy->txiqlocal_chanspec.channel_type = cfg80211_get_chandef_type(dev->phy.chandef);
+	nphy->txiqlocal_coeffsvalid = true;
+	cal->valid = true;
+	return 0;
+}
+
+/*
+ * PAPD calibration of radio 2057 rev 9, after the TX IQ/LO calibration and
+ * with the MAC suspended and TX power control off. The setup, measurement,
+ * PAD search and offset arithmetic follow brcmsmac (Copyright (c) 2010
+ * Broadcom Corporation, ISC license). On an error, nothing is restored here.
+ */
+static const u16 b43_nphy_papd_values[] = {
+	0x07a, 0x07b, 0x07c, 0x07d, 0x07e, 0x07f,
+	0x0a6, 0x0a7, 0x340, 0x341, 0x344, 0x345, 0x348, 0x349,
+};
+
+static const u16 b43_nphy_papd_enables[] = {
+	0x08f, 0x0a5, 0x0e7, 0x0ec, 0x342, 0x343, 0x346, 0x347,
+};
+
+static const u16 b43_nphy_papd_controls[] = {
+	0x29f, 0x2a0, 0x2a1, 0x2a2, 0x2e5,
+};
+
+static const u16 b43_nphy_papd_radio[] = {
+	R2057_TX0_TXRXCOUPLE_2G_ATTEN, R2057_TX0_TXRXCOUPLE_2G_PWRUP, 0x081,
+	R2057_TX1_TXRXCOUPLE_2G_ATTEN, R2057_TX1_TXRXCOUPLE_2G_PWRUP, 0x106,
+};
+
+static const u32 b43_nphy_papd_scalar[64] = {
+	0x0ae2002f, 0x0a3b0032, 0x09a70035, 0x09220038,
+	0x0887003c, 0x081f003f, 0x07a20043, 0x07340047,
+	0x06d2004b, 0x067a004f, 0x06170054, 0x05bf0059,
+	0x0571005e, 0x051e0064, 0x04d3006a, 0x04910070,
+	0x044c0077, 0x040f007e, 0x03d90085, 0x03a1008d,
+	0x036f0095, 0x033d009e, 0x030b00a8, 0x02e000b2,
+	0x02b900bc, 0x029200c7, 0x026d00d3, 0x024900e0,
+	0x022900ed, 0x020a00fb, 0x01ec010a, 0x01d0011a,
+	0x01b7012a, 0x019e013c, 0x0187014f, 0x01720162,
+	0x015d0177, 0x0149018e, 0x013701a5, 0x012601be,
+	0x011501d9, 0x010501f5, 0x00f70212, 0x00e90232,
+	0x00dc0253, 0x00d00276, 0x00c4029c, 0x00b902c3,
+	0x00af02ed, 0x00a5031a, 0x009c0349, 0x0093037a,
+	0x008b03af, 0x008303e7, 0x007c0422, 0x00750461,
+	0x006e04a3, 0x006804ea, 0x00620534, 0x005d0583,
+	0x005805d7, 0x0053062f, 0x004e068d, 0x004a06f1,
+};
+
+struct b43_nphy_papd_cal {
+	u16 values[ARRAY_SIZE(b43_nphy_papd_values)];
+	u16 enables[ARRAY_SIZE(b43_nphy_papd_enables)];
+	u16 controls[ARRAY_SIZE(b43_nphy_papd_controls)];
+	u16 radio[ARRAY_SIZE(b43_nphy_papd_radio)];
+	u16 filters[15];
+	u16 gains[2], bbmult[2], lpf_bw;
+	u16 gain[2];
+	s16 offset[2];
+	u8 pad[2], completed_cores;
+	bool attempted, snapshot_valid, command_owned, scratch_restored, published;
+	/* b43_ntab_rf_pwr_offset_2057_rev9_2g guesses entries 0 and 15. */
+	bool offset_uses_guessed_delta[2];
+};
+
+static bool b43_nphy_papd_saturated(u32 value)
+{
+	s16 real = sign_extend32(value, 12);
+	s16 imag = sign_extend32(value >> 13, 12);
+
+	return real == 4095 || real == -4096 || imag == 4095 || imag == -4096;
+}
+
+static void b43_nphy_papd_snapshot(struct b43_wldev *dev,
+				    struct b43_nphy_papd_cal *cal)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cal->values); i++)
+		cal->values[i] = b43_phy_read(dev, b43_nphy_papd_values[i]);
+	for (i = 0; i < ARRAY_SIZE(cal->enables); i++)
+		cal->enables[i] = b43_phy_read(dev, b43_nphy_papd_enables[i]);
+	for (i = 0; i < ARRAY_SIZE(cal->controls); i++)
+		cal->controls[i] = b43_phy_read(dev, b43_nphy_papd_controls[i]);
+	for (i = 0; i < ARRAY_SIZE(cal->radio); i++)
+		cal->radio[i] = b43_radio_read(dev, b43_nphy_papd_radio[i]);
+	for (i = 0; i < ARRAY_SIZE(cal->filters); i++)
+		cal->filters[i] = b43_phy_read(dev, 0x186 + i);
+	b43_ntab_read_bulk(dev, B43_NTAB16(7, 0x110), 2, cal->gains);
+	for (i = 0; i < 2; i++)
+		cal->bbmult[i] = b43_ntab_read(dev, B43_NTAB16(15, 87 + 8 * i));
+	cal->lpf_bw = b43_nphy_read_lpf_ctl(dev, 0);
+	cal->snapshot_valid = true;
+}
+
+static int b43_nphy_papd_setup(struct b43_wldev *dev,
+				 struct b43_nphy_cal_engine *engine,
+				 struct b43_nphy_papd_cal *cal, unsigned int core)
+{
+	unsigned int c;
+	u16 misc, enable, bb = core ? 0x0040 : 0x4000;
+
+	if (!b43_nphy_cal_accessible(dev))
+		return -EIO;
+	if (!b43_nphy_cal_idle(dev))
+		return -EBUSY;
+	for (c = 0; c < 2; c++) {
+		/* TX power-up overrides */
+		b43_phy_maskset(dev, 0x07a + 3 * c, (u16)~6,
+				c == core ? 2 : 0);
+		b43_phy_maskset(dev, 0x0a6 + c, (u16)~4, c == core ? 0 : 4);
+		misc = (cal->lpf_bw << 8) | 0x4000;
+		enable = 0x0882;
+		if (c == core) {
+			misc |= 0x100e;
+			enable |= 0x073d;
+		}
+		/* The values of enables 0x100 and 0x200 are bits 11 and 12. */
+		b43_phy_maskset(dev, 0x340 + c,
+				(u16)~(c == core ? 0x7f3f : 0x4702), misc);
+		b43_phy_maskset(dev, 0x344 + c, (u16)~(c == core ? 7 : 5),
+				c == core ? 7 : 0);
+		b43_phy_set(dev, c ? 0x0ec : 0x0e7, 0x000c);
+		b43_phy_set(dev, 0x342 + c, enable);
+		b43_phy_set(dev, 0x346 + c, c == core ? 7 : 5);
+		b43_phy_set(dev, c ? 0x0a5 : 0x08f, 0x0104);
+		b43_radio_write(dev, b43_nphy_papd_radio[3 * c],
+				c == core ? 0xf2 : 0xff);
+		b43_radio_write(dev, b43_nphy_papd_radio[3 * c + 1],
+				c == core ? 0x0c : 0);
+		b43_radio_write(dev, b43_nphy_papd_radio[3 * c + 2], 0);
+		/* Multiplier 64 on the calibrated core, 0 on the other */
+		b43_ntab_write(dev, B43_NTAB16(15, 87 + 8 * c), bb);
+	}
+	b43_phy_write(dev, 0x07b + 3 * core, 0);
+	b43_phy_set(dev, core ? 0x0ec : 0x0e7, 0x0800);
+	return b43_nphy_cal_engine_start(dev, engine);
+}
+
+/* The PAPD command register, or -EIO when the PHY is not accessible */
+static int b43_nphy_papd_command(struct b43_wldev *dev)
+{
+	if (!b43_nphy_cal_accessible(dev))
+		return -EIO;
+	return b43_phy_read(dev, 0x2be);
+}
+
+static int b43_nphy_papd_measure(struct b43_wldev *dev,
+				   struct b43_nphy_cal_engine *engine,
+				   struct b43_nphy_papd_cal *cal,
+				   unsigned int core, u8 pad, bool full,
+				   u32 *endpoint)
+{
+	unsigned int c;
+	u16 gain = (cal->gains[core] & ~0x00f8) | (pad << 3);
+	int command, err;
+
+	if (!b43_nphy_cal_accessible(dev))
+		return -EIO;
+	if (cal->command_owned || b43_phy_read(dev, 0x2be) ||
+	    !engine->sample_owned || engine->estimator_owned ||
+	    (b43_phy_read(dev, B43_NPHY_SAMP_STAT) & 3) != 1 ||
+	    (b43_phy_read(dev, B43_NPHY_IQLOCAL_CMDGCTL) & 0x8000) ||
+	    (b43_phy_read(dev, B43_NPHY_IQLOCAL_CMD) & 0xc000) ||
+	    (b43_phy_read(dev, B43_NPHY_IQEST_CMD) & B43_NPHY_IQEST_CMD_START) ||
+	    ((b43_phy_read(dev, B43_NPHY_RFSEQTR) |
+	      b43_phy_read(dev, B43_NPHY_RFSEQST)) & 0x3f))
+		return -EBUSY;
+	/* TX gain override; bit 15 goes to 0x348 + core. */
+	b43_phy_write(dev, 0x07c + 3 * core, gain & 0x7fff);
+	b43_phy_maskset(dev, 0x348 + core, (u16)~0x000f,
+			(gain & 0x8000) >> 14);
+	b43_phy_set(dev, core ? 0x0ec : 0x0e7, 0x3000);
+	for (c = 0; c < 2; c++) {
+		b43_phy_maskset(dev, 0x297 + 4 * c, (u16)~1, c == core);
+		b43_phy_maskset(dev, 0x2a3 + c, (u16)~0x2fff,
+				c == core ? 0x2bb3 : 0x0bb3);
+	}
+	b43_phy_write(dev, 0x2a1, 0x0080);
+	b43_phy_write(dev, 0x2a2, 0x0100);
+	/* Unknown; b43_nphy_cal_papd() checked that it was 0. */
+	b43_phy_write(dev, 0x358, 0);
+	b43_phy_write(dev, 0x2e5, full ? 0x20 : 0x10);
+	b43_phy_maskset(dev, 0x2a0, (u16)~0x003f, 25);
+	b43_phy_maskset(dev, 0x29f, (u16)~0x3f3f, 0x3f00 | (full ? 25 : 55));
+	for (c = 0; c < 2; c++)
+		b43_phy_maskset(dev, 0x07a + 3 * c, (u16)~4, c == core ? 4 : 0);
+
+	cal->command_owned = true;
+	b43_phy_write(dev, 0x2be, 1);
+	/* Wait up to 10 s. */
+	err = read_poll_timeout(b43_nphy_papd_command, command, command <= 0,
+				1100, 10 * USEC_PER_SEC, false, dev);
+	if (err)
+		return err;
+	if (command < 0)
+		return command;
+	if (!b43_nphy_cal_accessible(dev))
+		return -EIO;
+	cal->command_owned = false;
+	for (c = 0; c < 2; c++)
+		b43_phy_mask(dev, 0x07a + 3 * c, (u16)~4);
+	/* Entry 25 is the reference point; it is not measured. */
+	b43_ntab_write(dev, B43_NTAB32(31 + 2 * core, 25), 0);
+	*endpoint = b43_ntab_read(dev, B43_NTAB32(31 + 2 * core, 63));
+	return *endpoint & ~0x03ffffffU ? -EBADMSG : 0;
+}
+
+static int b43_nphy_papd_core(struct b43_wldev *dev,
+			     struct b43_nphy_cal_engine *engine,
+			     struct b43_nphy_papd_cal *cal,
+			     const s16 *delta, unsigned int core)
+{
+	unsigned int i;
+	u32 word;
+	int pad, selected = -1, err;
+	bool nonzero = false;
+
+	err = b43_nphy_papd_setup(dev, engine, cal, core);
+	if (err)
+		return err;
+	for (pad = 15; pad >= 0; pad--) {
+		err = b43_nphy_papd_measure(dev, engine, cal, core, pad, false, &word);
+		if (err)
+			return err;
+		if (!b43_nphy_papd_saturated(word)) {
+			selected = pad == 15 ? pad : pad + 1;
+			break;
+		}
+	}
+	if (selected < 0)
+		return -ERANGE;
+	cal->pad[core] = selected;
+	cal->gain[core] = (cal->gains[core] & ~0x00f8) | (selected << 3);
+	err = b43_nphy_papd_measure(dev, engine, cal, core, selected, true, &word);
+	if (err)
+		return err;
+	for (i = 0; i < ARRAY_SIZE(b43_nphy_papd_scalar); i++) {
+		word = b43_ntab_read(dev, B43_NTAB32(31 + 2 * core, i));
+		if ((word & ~0x03ffffffU) || (i <= 25 && word))
+			return -EBADMSG;
+		if (i > 25)
+			nonzero |= word != 0;
+	}
+	if (!nonzero)
+		return -ENODATA;
+	/* The full curve may saturate: the search picked the PAD above the
+	 * first unsaturated one. */
+	cal->offset[core] = -60 + 27 - 1 - (delta[selected] + 1) / 2;
+	if (cal->offset[core] < -256 || cal->offset[core] > 255)
+		return -ERANGE;
+	cal->offset_uses_guessed_delta[core] = selected == 0 || selected == 15;
+	cal->completed_cores++;
+	return 0;
+}
+
+/* Undoes b43_nphy_papd_setup() after the sample play stopped. */
+static int b43_nphy_papd_restore_loop(struct b43_wldev *dev,
+				    struct b43_nphy_papd_cal *cal)
+{
+	unsigned int i;
+
+	if (!b43_nphy_cal_accessible(dev))
+		return -EIO;
+	if (cal->command_owned || !b43_nphy_cal_idle(dev))
+		return -EBUSY;
+	for (i = 0; i < ARRAY_SIZE(cal->radio); i++)
+		b43_radio_write(dev, b43_nphy_papd_radio[i], cal->radio[i]);
+	/* Restore the override values before their enables. */
+	for (i = 0; i < ARRAY_SIZE(cal->values); i++)
+		b43_phy_write(dev, b43_nphy_papd_values[i], cal->values[i]);
+	for (i = 0; i < ARRAY_SIZE(cal->enables); i++)
+		b43_phy_write(dev, b43_nphy_papd_enables[i], cal->enables[i]);
+	/* Entries 87 and 95 can differ; restore each. */
+	for (i = 0; i < 2; i++)
+		b43_ntab_write(dev, B43_NTAB16(15, 87 + 8 * i), cal->bbmult[i]);
+	return b43_nphy_cal_rfseq(dev, B43_RFSEQ_RESET2RX);
+}
+
+static int b43_nphy_papd_publish(struct b43_wldev *dev,
+			       struct b43_nphy_papd_cal *cal)
+{
+	unsigned int c;
+	u16 offset;
+
+	if (!b43_nphy_cal_accessible(dev))
+		return -EIO;
+	if (!b43_nphy_cal_idle(dev))
+		return -EBUSY;
+	/* Both enables remain clear until both cores' values are installed. */
+	for (c = 0; c < 2; c++) {
+		offset = ((u32)(u16)cal->offset[c] << 7) & 0xff80;
+		b43_phy_maskset(dev, 0x298 + 4 * c, 0x007f, offset);
+		b43_phy_maskset(dev, 0x2a3 + c, (u16)~0x2fff, 0x0bb3);
+		if ((b43_phy_read(dev, 0x298 + 4 * c) & 0xff80) != offset ||
+		    (b43_phy_read(dev, 0x2a3 + c) & 0x2fff) != 0x0bb3)
+			return -EIO;
+	}
+	for (c = 0; c < 2; c++)
+		b43_phy_set(dev, 0x297 + 4 * c, 1);
+	for (c = 0; c < 2; c++)
+		if (!(b43_phy_read(dev, 0x297 + 4 * c) & 1))
+			return -EIO;
+	if (!b43_nphy_cal_accessible(dev))
+		return -EIO;
+	for (c = 0; c < 2; c++)
+		dev->phy.n->papd_epsilon_offset[c] = (u16)cal->offset[c];
+	cal->published = true;
+	return 0;
+}
+
+static int b43_nphy_cal_papd(struct b43_wldev *dev,
+			   struct b43_nphy_cal_engine *engine,
+			   struct b43_nphy_papd_cal *cal)
+{
+	const s16 *delta;
+	unsigned int core, i;
+	int err;
+
+	if (!engine || !cal)
+		return -EINVAL;
+	lockdep_assert_held(&dev->wl->mutex);
+	if (cal->attempted)
+		return -EALREADY;
+	cal->attempted = true;
+	if (!b43_nphy_cal_accessible(dev))
+		return -EIO;
+	if (!engine->entered || engine->sample_owned || engine->estimator_owned ||
+	    !b43_nphy_cal_idle(dev) ||
+	    (b43_phy_read(dev, B43_NPHY_TXPCTL_CMD) & 0xe000))
+		return -EBUSY;
+	delta = b43_ntab_get_rf_pwr_offset_table(dev);
+	if (!delta)
+		return -EOPNOTSUPP;
+	b43_nphy_papd_snapshot(dev, cal);
+	/* Only calibrate from the PHY state that this was tested with. */
+	if (b43_phy_read(dev, 0x358) || (cal->controls[1] & ~0x003f) != 0x0040 ||
+	    cal->radio[1] || cal->radio[4] || cal->lpf_bw > 7 ||
+	    ((cal->enables[2] | cal->enables[3]) & 0x3000))
+		return -EOPNOTSUPP;
+	err = b43_nphy_cal_engine_load_wave(dev, engine, 4000, 181);
+	if (err)
+		return err;
+	/* Turn off PAPD compensation while writing the new tables. */
+	for (core = 0; core < 2; core++)
+		b43_phy_mask(dev, 0x297 + 4 * core, (u16)~1);
+	for (core = 0; core < 2; core++) {
+		for (i = 0; i < ARRAY_SIZE(b43_nphy_papd_scalar); i++)
+			b43_ntab_write(dev, B43_NTAB32(31 + 2 * core, i), 0);
+		b43_ntab_write_bulk(dev, B43_NTAB32(32 + 2 * core, 0),
+				    ARRAY_SIZE(b43_nphy_papd_scalar), b43_nphy_papd_scalar);
+	}
+	for (i = 0; i < ARRAY_SIZE(cal->filters); i++)
+		b43_phy_write(dev, 0x186 + i, (u16)tbl_tx_filter_coef_rev4[3][i] & 0x0fff);
+	for (core = 0; core < 2; core++) {
+		err = b43_nphy_papd_core(dev, engine, cal, delta, core);
+		if (err)
+			return err;
+		err = b43_nphy_cal_engine_stop(dev, engine);
+		if (err)
+			return err;
+		err = b43_nphy_papd_restore_loop(dev, cal);
+		if (err)
+			return err;
+	}
+	for (core = 0; core < 2; core++)
+		b43_phy_mask(dev, 0x297 + 4 * core, (u16)~1);
+	for (i = 0; i < ARRAY_SIZE(cal->filters); i++)
+		b43_phy_write(dev, 0x186 + i, cal->filters[i]);
+	for (i = 0; i < ARRAY_SIZE(cal->controls); i++)
+		b43_phy_write(dev, b43_nphy_papd_controls[i], cal->controls[i]);
+	cal->scratch_restored = true;
+	return b43_nphy_papd_publish(dev, cal);
+}
+
+/*
+ * RX IQ calibration of radio 2057 rev 9, after the TX IQ/LO and PAPD
+ * calibrations. The loopback setup, gain search and coefficient arithmetic
+ * follow brcmsmac (Copyright (c) 2010 Broadcom Corporation, ISC license).
+ * Each core's loopback is undone after its measurement, and neither core's
+ * coefficients are written before both are done. On an error, nothing is
+ * restored here.
+ */
+enum b43_nphy_rx_value {
+	B43_RXV_RFSEQCA,
+	B43_RXV_AFE0, B43_RXV_AFE1,
+	B43_RXV_DAC0, B43_RXV_DAC1,
+	B43_RXV_RSSIO0, B43_RXV_RSSIO1,
+	B43_RXV_RXGAIN0, B43_RXV_RXGAIN1,
+	B43_RXV_MISC0, B43_RXV_MISC1,
+	B43_RXV_MISC20, B43_RXV_MISC21,
+	B43_RXV_LPFGAIN0, B43_RXV_LPFGAIN1,
+	B43_RXV_COUNT,
+};
+
+enum b43_nphy_rx_enable {
+	B43_RXE_AFE0, B43_RXE_AFE1,
+	B43_RXE_OVER00, B43_RXE_OVER01,
+	B43_RXE_OVER10, B43_RXE_OVER11,
+	B43_RXE_OVER20, B43_RXE_OVER21,
+	B43_RXE_INTC0, B43_RXE_INTC1,
+	B43_RXE_TRSW,
+	B43_RXE_PAPD0, B43_RXE_PAPD1,
+	B43_RXE_COUNT,
+};
+
+struct b43_nphy_rx_loopback {
+	bool active;
+	u16 values[B43_RXV_COUNT];
+	u16 enables[B43_RXE_COUNT];
+	u16 gain[2];
+	u16 bbmult[2]; /* table 15 entries 87 and 95 */
+	u16 coupling_atten[2];
+	u16 coupling_pwr[2];
+	u32 fixed_txgain;
+	u32 fixed_rfpwr;
+};
+
+struct b43_nphy_rx_cal {
+	struct b43_nphy_rx_loopback loopback[2];
+	struct b43_phy_n_iq_comp entry, pending;
+	struct nphy_iq_est estimate[2];
+	u32 selected_power[2];
+	u8 coarse_index[2], fine_biq1[2];
+	unsigned int completed_cores;
+	bool attempted, entry_saved, valid;
+	int error;
+};
+
+static const u16 b43_nphy_rx_value_regs[B43_RXV_COUNT] = {
+	[B43_RXV_RFSEQCA] = B43_NPHY_RFSEQCA,
+	[B43_RXV_AFE0] = B43_NPHY_AFECTL_C1,
+	[B43_RXV_AFE1] = B43_NPHY_AFECTL_C2,
+	[B43_RXV_DAC0] = B43_NPHY_AFECTL_DACGAIN1,
+	[B43_RXV_DAC1] = B43_NPHY_AFECTL_DACGAIN2,
+	[B43_RXV_RSSIO0] = B43_NPHY_RFCTL_RSSIO1,
+	[B43_RXV_RSSIO1] = B43_NPHY_RFCTL_RSSIO2,
+	[B43_RXV_RXGAIN0] = B43_NPHY_RFCTL_RXG1,
+	[B43_RXV_RXGAIN1] = B43_NPHY_RFCTL_RXG2,
+	[B43_RXV_MISC0] = 0x340, [B43_RXV_MISC1] = 0x341,
+	[B43_RXV_MISC20] = 0x344, [B43_RXV_MISC21] = 0x345,
+	[B43_RXV_LPFGAIN0] = 0x348, [B43_RXV_LPFGAIN1] = 0x349,
+};
+
+static const u16 b43_nphy_rx_enable_regs[B43_RXE_COUNT] = {
+	[B43_RXE_AFE0] = B43_NPHY_AFECTL_OVER1,
+	[B43_RXE_AFE1] = B43_NPHY_AFECTL_OVER,
+	[B43_RXE_OVER00] = 0x0e7, [B43_RXE_OVER01] = 0x0ec,
+	[B43_RXE_OVER10] = 0x342, [B43_RXE_OVER11] = 0x343,
+	[B43_RXE_OVER20] = 0x346, [B43_RXE_OVER21] = 0x347,
+	[B43_RXE_INTC0] = B43_NPHY_RFCTL_INTC1,
+	[B43_RXE_INTC1] = B43_NPHY_RFCTL_INTC2,
+	[B43_RXE_TRSW] = 0x2ff,
+	[B43_RXE_PAPD0] = B43_NPHY_PAPD_EN0,
+	[B43_RXE_PAPD1] = B43_NPHY_PAPD_EN1,
+};
+
+static const u16 b43_nphy_rx_atten_regs[2] = {
+	R2057_TX0_TXRXCOUPLE_2G_ATTEN, R2057_TX1_TXRXCOUPLE_2G_ATTEN,
+};
+static const u16 b43_nphy_rx_pwr_regs[2] = {
+	R2057_TX0_TXRXCOUPLE_2G_PWRUP, R2057_TX1_TXRXCOUPLE_2G_PWRUP,
+};
+
+/* RX gains (BIQ1:BIQ0:mixer:LNA2:LNA1) to search, at TX gain index 10 */
+static const u16 b43_nphy_rx_gains[] = {
+	0x0030, 0x0034, 0x0138, 0x013c, 0x043c, 0x063c,
+};
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/CalcRxIqComp */
+static int b43_nphy_rx_coefficients(s32 iq, u32 ii, u32 qq,
+				    s16 *a_out, s16 *b_out)
+{
+	u64 magnitude, numerator, denominator, half, ratio, square;
+	s64 signed_numerator, a, b;
+	int n, m, arsh, brsh, shift;
+
+	if (!a_out || !b_out)
+		return -EINVAL;
+	if (!ii || !qq)
+		return -ERANGE;
+	magnitude = abs((s64)iq);
+	if (magnitude * magnitude > (u64)ii * qq)
+		return -ERANGE;
+	n = fls((u32)magnitude);
+	m = fls(qq);
+	arsh = n - 20;
+	brsh = m - 11;
+
+	/* brcmsmac's wlc_phy_calc_rx_iq_comp_nphy(), in 64 bits */
+	if (arsh >= 0) {
+		half = (u64)ii >> (1 + arsh);
+		denominator = (u64)ii >> arsh;
+	} else {
+		half = (u64)ii << (-1 - arsh);
+		denominator = (u64)ii << -arsh;
+	}
+	shift = 30 - n;
+	if (shift >= 0) {
+		signed_numerator = -(s64)iq * (1LL << shift);
+	} else {
+		/* For n of 31 or 32, brcmsmac's shift is negative: scale the
+		 * denominator up instead. */
+		signed_numerator = -(s64)iq;
+		half <<= -shift;
+		denominator <<= -shift;
+	}
+	if (!denominator)
+		return -ERANGE;
+	signed_numerator += (s64)half;
+	a = div64_s64(signed_numerator, (s64)denominator);
+	if (a < -512 || a > 511)
+		return -ERANGE;
+
+	denominator = brsh >= 0 ? (u64)ii >> brsh : (u64)ii << -brsh;
+	shift = 31 - m;
+	if (shift >= 0) {
+		numerator = (u64)qq << shift;
+	} else {
+		/* Likewise for m of 32 */
+		numerator = qq;
+		denominator <<= -shift;
+	}
+	if (!denominator)
+		return -ERANGE;
+	ratio = div64_u64(numerator, denominator);
+	square = (u64)(a * a);
+	if (ratio < square)
+		return -ERANGE;
+	b = (s64)int_sqrt64(ratio - square) - 1024;
+	if (b < -512 || b > 511)
+		return -ERANGE;
+	/* 10-bit two's complement */
+	*a_out = (u16)a & 0x3ff;
+	*b_out = (u16)b & 0x3ff;
+	return 0;
+}
+
+static int b43_nphy_rx_write_comp(struct b43_wldev *dev,
+				  struct b43_phy_n_iq_comp *comp)
+{
+	struct b43_phy_n_iq_comp observed;
+
+	b43_nphy_rx_iq_coeffs(dev, true, comp);
+	b43_nphy_rx_iq_coeffs(dev, false, &observed);
+	return observed.a0 == comp->a0 && observed.b0 == comp->b0 &&
+	       observed.a1 == comp->a1 && observed.b1 == comp->b1 ? 0 : -EIO;
+}
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/RxCalPhySetup */
+static int b43_nphy_rx_loopback_prepare(struct b43_wldev *dev,
+					struct b43_nphy_cal_engine *engine,
+					struct b43_nphy_rx_loopback *s,
+					unsigned int core)
+{
+	unsigned int i;
+	u16 reg, mult;
+	int err;
+
+	if (s->active || engine->sample_owned || engine->estimator_owned ||
+	    !b43_nphy_cal_idle(dev))
+		return -EBUSY;
+	for (i = 0; i < B43_RXV_COUNT; i++)
+		s->values[i] = b43_phy_read(dev, b43_nphy_rx_value_regs[i]);
+	for (i = 0; i < B43_RXE_COUNT; i++)
+		s->enables[i] = b43_phy_read(dev, b43_nphy_rx_enable_regs[i]);
+	b43_ntab_read_bulk(dev, B43_NTAB16(7, 0x110), 2, s->gain);
+	s->bbmult[0] = b43_ntab_read(dev, B43_NTAB16(15, 87));
+	s->bbmult[1] = b43_ntab_read(dev, B43_NTAB16(15, 95));
+	for (i = 0; i < 2; i++) {
+		s->coupling_atten[i] = b43_radio_read(dev, b43_nphy_rx_atten_regs[i]);
+		s->coupling_pwr[i] = b43_radio_read(dev, b43_nphy_rx_pwr_regs[i]);
+	}
+	/* Start with the couplers off and no TX gain override. */
+	if (s->coupling_pwr[0] || s->coupling_pwr[1] ||
+	    (s->enables[B43_RXE_OVER00 + core] & 0x1000))
+		return -EBUSY;
+	s->fixed_txgain = b43_ntab_read(dev, B43_NTAB32(26 + core, 192 + 10));
+	s->fixed_rfpwr = b43_ntab_read(dev, B43_NTAB32(26 + core, 576 + 10));
+	s->active = true;
+
+	/* Override the DACs and turn PAPD off meanwhile. */
+	b43_phy_set(dev, B43_NPHY_AFECTL_OVER1, 0x0100);
+	b43_phy_set(dev, B43_NPHY_AFECTL_OVER, 0x0100);
+	b43_phy_mask(dev, B43_NPHY_PAPD_EN0, ~1);
+	b43_phy_mask(dev, B43_NPHY_PAPD_EN1, ~1);
+	b43_phy_maskset(dev, B43_NPHY_RFSEQCA, (u16)~0xf00f,
+		       BIT(core) | (BIT(1 - core) << 12));
+	b43_phy_mask(dev, b43_nphy_rx_value_regs[B43_RXV_AFE0 + core], ~4);
+	b43_phy_set(dev, b43_nphy_rx_enable_regs[B43_RXE_AFE0 + core], 4);
+	for (i = 0; i < 2; i++) {
+		/* PA off on both cores */
+		reg = b43_nphy_rx_enable_regs[B43_RXE_INTC0 + i];
+		b43_phy_mask(dev, reg, ~0x0030);
+		b43_phy_set(dev, reg, 0x1000);
+		b43_phy_mask(dev, b43_nphy_rx_value_regs[B43_RXV_RSSIO0 + i], ~4);
+		b43_phy_maskset(dev, 0x340 + i, (u16)~0x6f21, 0x2001);
+		b43_phy_set(dev, 0x344 + i, 2);
+		b43_phy_set(dev, b43_nphy_rx_enable_regs[B43_RXE_OVER00 + i], 8);
+		/* Not 0x80: the sample play overrides the LPF. */
+		b43_phy_set(dev, 0x342 + i, 0x0ea1);
+		b43_phy_set(dev, 0x346 + i, 2);
+	}
+	err = b43_nphy_cal_rfseq(dev, B43_RFSEQ_RX2TX);
+	if (err)
+		return err;
+
+	reg = b43_nphy_rx_enable_regs[B43_RXE_INTC0 + core];
+	b43_phy_maskset(dev, reg, ~0x00c0, 0x0040);
+	b43_phy_set(dev, reg, 0x0400);
+	b43_phy_maskset(dev, 0x2ff, (u16)~0xc000, 0x2001);
+	b43_radio_write(dev, b43_nphy_rx_pwr_regs[core], 3);
+	b43_radio_write(dev, b43_nphy_rx_atten_regs[core], 0x7f);
+	/* Start with b43_nphy_rx_gains[3]. */
+	for (i = 0; i < 2; i++) {
+		b43_phy_write(dev, b43_nphy_rx_value_regs[B43_RXV_RXGAIN0 + i], 0x003c);
+		b43_phy_maskset(dev, 0x348 + i, ~0x00ff, 1);
+		b43_phy_set(dev, b43_nphy_rx_enable_regs[B43_RXE_OVER00 + i], 0x6800);
+	}
+	/* TX gain index 10 of this core, without its stored calibration */
+	b43_phy_write(dev, b43_nphy_rx_value_regs[B43_RXV_DAC0 + core],
+		      (s->fixed_txgain >> 8) & 0x3f);
+	b43_ntab_write(dev, B43_NTAB16(7, 0x110 + core), s->fixed_txgain >> 16);
+	mult = s->fixed_txgain & 0xff;
+	mult = core ? ((s->bbmult[0] & 0xff00) | mult) :
+		      ((s->bbmult[0] & 0x00ff) | (mult << 8));
+	b43_ntab_write(dev, B43_NTAB16(15, 87), mult);
+	reg = b43_nphy_rx_enable_regs[B43_RXE_PAPD0 + core];
+	b43_phy_maskset(dev, reg, (u16)~0x1ff0, (s->fixed_rfpwr << 4) & 0x1ff0);
+	b43_phy_set(dev, reg, 4);
+	return 0;
+}
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/RxCalPhyCleanup */
+static int b43_nphy_rx_loopback_restore(struct b43_wldev *dev,
+					struct b43_nphy_cal_engine *engine,
+					struct b43_nphy_rx_loopback *s)
+{
+	unsigned int i;
+	u16 reg;
+	int err;
+
+	if (!s->active || engine->sample_owned || engine->estimator_owned ||
+	    !b43_nphy_cal_idle(dev))
+		return -EBUSY;
+	/* Turn off the couplers and the overrides before restoring their
+	 * values, so that no restored value goes through an override that is
+	 * still on.
+	 */
+	for (i = 0; i < 2; i++) {
+		b43_radio_write(dev, b43_nphy_rx_pwr_regs[i], 0);
+		b43_phy_mask(dev, b43_nphy_rx_enable_regs[B43_RXE_PAPD0 + i], ~5);
+		b43_phy_mask(dev, b43_nphy_rx_enable_regs[B43_RXE_AFE0 + i], ~0x0104);
+		b43_phy_mask(dev, b43_nphy_rx_enable_regs[B43_RXE_OVER00 + i], ~0x6808);
+		b43_phy_mask(dev, 0x342 + i, ~0x0ea1);
+		b43_phy_mask(dev, 0x346 + i, ~2);
+		b43_phy_mask(dev, b43_nphy_rx_enable_regs[B43_RXE_INTC0 + i], ~0x1400);
+	}
+	b43_phy_mask(dev, 0x2ff, ~0x2000);
+	for (i = 0; i < 2; i++) {
+		b43_radio_write(dev, b43_nphy_rx_atten_regs[i], s->coupling_atten[i]);
+		b43_radio_write(dev, b43_nphy_rx_pwr_regs[i], s->coupling_pwr[i]);
+	}
+	for (i = 0; i < B43_RXV_COUNT; i++)
+		b43_phy_write(dev, b43_nphy_rx_value_regs[i], s->values[i]);
+	b43_ntab_write_bulk(dev, B43_NTAB16(7, 0x110), 2, s->gain);
+	b43_ntab_write(dev, B43_NTAB16(15, 87), s->bbmult[0]);
+	b43_ntab_write(dev, B43_NTAB16(15, 95), s->bbmult[1]);
+	for (i = 0; i < 2; i++) {
+		reg = b43_nphy_rx_enable_regs[B43_RXE_PAPD0 + i];
+		b43_phy_write(dev, reg, s->enables[B43_RXE_PAPD0 + i] & ~5);
+		reg = b43_nphy_rx_enable_regs[B43_RXE_INTC0 + i];
+		b43_phy_write(dev, reg, s->enables[B43_RXE_INTC0 + i] & ~0x1400);
+	}
+	b43_phy_write(dev, 0x2ff, s->enables[B43_RXE_TRSW] & ~0x2000);
+	for (i = 0; i < B43_RXE_COUNT; i++)
+		b43_phy_write(dev, b43_nphy_rx_enable_regs[i], s->enables[i]);
+	err = b43_nphy_cal_rfseq(dev, B43_RFSEQ_RESET2RX);
+	if (err)
+		return err;
+	/* Check that everything was restored. */
+	for (i = 0; i < B43_RXV_COUNT; i++)
+		if (b43_phy_read(dev, b43_nphy_rx_value_regs[i]) != s->values[i])
+			return -EIO;
+	for (i = 0; i < B43_RXE_COUNT; i++)
+		if (b43_phy_read(dev, b43_nphy_rx_enable_regs[i]) != s->enables[i])
+			return -EIO;
+	for (i = 0; i < 2; i++) {
+		if (b43_radio_read(dev, b43_nphy_rx_atten_regs[i]) != s->coupling_atten[i] ||
+		    b43_radio_read(dev, b43_nphy_rx_pwr_regs[i]) != s->coupling_pwr[i] ||
+		    b43_ntab_read(dev, B43_NTAB16(7, 0x110 + i)) != s->gain[i] ||
+		    b43_ntab_read(dev, B43_NTAB16(15, 87 + 8 * i)) != s->bbmult[i])
+			return -EIO;
+	}
+	s->active = false;
+	return 0;
+}
+
+static int b43_nphy_rx_set_gain(struct b43_wldev *dev, u16 gain)
+{
+	unsigned int core;
+
+	if (!b43_nphy_cal_idle(dev))
+		return -EBUSY;
+	for (core = 0; core < 2; core++) {
+		b43_phy_write(dev, b43_nphy_rx_value_regs[B43_RXV_RXGAIN0 + core], gain & 0xff);
+		b43_phy_maskset(dev, 0x348 + core, (u16)~0xff, gain >> 8);
+		b43_phy_set(dev, b43_nphy_rx_enable_regs[B43_RXE_OVER00 + core], 0x6800);
+	}
+	return 0;
+}
+
+static int b43_nphy_rx_search(struct b43_wldev *dev,
+			      struct b43_nphy_cal_engine *engine,
+			      struct b43_nphy_rx_cal *cal, unsigned int core)
+{
+	struct nphy_iq_est estimate;
+	u32 power, previous_power = 0, selected_power = 0;
+	u32 ii, qq;
+	int index = 3, previous = 3, selected = 3, direction = 0, fine;
+	int err;
+	u16 gain;
+	bool done = false;
+
+	while (!done) {
+		err = b43_nphy_rx_set_gain(dev, b43_nphy_rx_gains[index]);
+		if (err)
+			return err;
+		err = b43_nphy_cal_engine_start(dev, engine);
+		if (err)
+			return err;
+		err = b43_nphy_cal_engine_measure(dev, engine, 1024, &estimate);
+		if (err)
+			return err;
+		err = b43_nphy_cal_engine_stop(dev, engine);
+		if (err)
+			return err;
+		ii = core ? estimate.i1_pwr : estimate.i0_pwr;
+		qq = core ? estimate.q1_pwr : estimate.q0_pwr;
+		/* Round the I and Q powers separately, as brcmsmac does. */
+		power = DIV_ROUND_CLOSEST_ULL((u64)ii, 1024) +
+			DIV_ROUND_CLOSEST_ULL((u64)qq, 1024);
+		if (!direction) {
+			direction = power > 10000 ? -1 : 1;
+			previous = index;
+			index += direction;
+		} else if (direction > 0 && power > 10000) {
+			selected = previous;
+			selected_power = previous_power;
+			done = true;
+		} else if (direction < 0 && power <= 10000) {
+			selected = index;
+			selected_power = power;
+			done = true;
+		} else {
+			previous = index;
+			index += direction;
+		}
+		if (index < 0 || index >= (int)ARRAY_SIZE(b43_nphy_rx_gains)) {
+			selected = previous;
+			selected_power = power;
+			done = true;
+		} else {
+			previous_power = power;
+		}
+	}
+	gain = b43_nphy_rx_gains[selected];
+	fine = (gain >> 12) + 13 - fls(selected_power);
+	fine = clamp(fine, 0, 10 - (int)((gain >> 8) & 0xf));
+	gain = (gain & 0x0fff) | (fine << 12);
+	cal->coarse_index[core] = selected;
+	cal->fine_biq1[core] = fine;
+	cal->selected_power[core] = selected_power;
+	return b43_nphy_rx_set_gain(dev, gain);
+}
+
+static int b43_nphy_rx_core(struct b43_wldev *dev,
+			    struct b43_nphy_cal_engine *engine,
+			    struct b43_nphy_rx_cal *cal, unsigned int core)
+{
+	struct b43_phy_n_iq_comp zero = { };
+	struct nphy_iq_est *estimate = &cal->estimate[core];
+	s16 a, b;
+	int err;
+
+	err = b43_nphy_rx_loopback_prepare(dev, engine, &cal->loopback[core], core);
+	if (err)
+		return err;
+	err = b43_nphy_rx_write_comp(dev, &zero);
+	if (err)
+		return err;
+	err = b43_nphy_rx_search(dev, engine, cal, core);
+	if (err)
+		return err;
+	/* Measure with the compensation still zero. */
+	err = b43_nphy_cal_engine_start(dev, engine);
+	if (err)
+		return err;
+	err = b43_nphy_cal_engine_measure(dev, engine, 16384, estimate);
+	if (err)
+		return err;
+	err = b43_nphy_rx_coefficients(core ? estimate->iq1_prod : estimate->iq0_prod,
+				       core ? estimate->i1_pwr : estimate->i0_pwr,
+				       core ? estimate->q1_pwr : estimate->q0_pwr, &a, &b);
+	if (err)
+		return err;
+	if (core) {
+		cal->pending.a1 = a;
+		cal->pending.b1 = b;
+	} else {
+		cal->pending.a0 = a;
+		cal->pending.b0 = b;
+	}
+	err = b43_nphy_cal_engine_stop(dev, engine);
+	if (err)
+		return err;
+	err = b43_nphy_rx_write_comp(dev, &cal->entry);
+	if (err)
+		return err;
+	return b43_nphy_rx_loopback_restore(dev, engine, &cal->loopback[core]);
+}
+
+/* https://bcm-v4.sipsolutions.net/802.11/PHY/N/CalRxIqRev3 */
+static int b43_nphy_cal_rx(struct b43_wldev *dev,
+			   struct b43_nphy_cal_engine *engine,
+			   struct b43_nphy_rx_cal *cal)
+{
+	unsigned int core;
+	int err;
+
+	if (!cal || !engine)
+		return -EINVAL;
+	lockdep_assert_held(&dev->wl->mutex);
+	if (cal->attempted)
+		return -EALREADY;
+	cal->attempted = true;
+	if (!engine->entered || engine->sample_owned || engine->estimator_owned ||
+	    !b43_nphy_cal_idle(dev)) {
+		err = -EBUSY;
+		goto out;
+	}
+	/* TX power control must be off. */
+	if (b43_phy_read(dev, B43_NPHY_TXPCTL_CMD) & 0xe000) {
+		err = -EBUSY;
+		goto out;
+	}
+	b43_nphy_rx_iq_coeffs(dev, false, &cal->entry);
+	cal->entry_saved = true;
+	err = b43_nphy_cal_engine_load_wave(dev, engine, 2000, 250);
+	if (err)
+		goto out;
+	for (core = 0; core < 2; core++) {
+		err = b43_nphy_rx_core(dev, engine, cal, core);
+		if (err)
+			goto out;
+		cal->completed_cores++;
+	}
+	if (!b43_nphy_cal_idle(dev)) {
+		err = -EBUSY;
+		goto out;
+	}
+	/* Install both cores' coefficients together. */
+	err = b43_nphy_rx_write_comp(dev, &cal->pending);
+	if (!err)
+		cal->valid = true;
+out:
+	cal->error = err;
+	return err;
+}
+
+struct b43_nphy_calibration {
+	struct b43_nphy_cal_engine engine;
+	struct b43_nphy_tx_cal tx;
+	struct b43_nphy_papd_cal papd;
+	struct b43_nphy_rx_cal rx;
+	u16 radio[32];
+	const char *stage;
+	bool radio_saved, valid;
+};
+
+static u16 b43_nphy_cal_radio_reg(unsigned int index)
+{
+	static const u16 tail[] = { 0x17d, 0x17e, 0x081, 0x19d, 0x19e, 0x106 };
+
+	return index < 26 ? 0x170 + (index / 13) * 0x20 + index % 13 : tail[index - 26];
+}
+
+/* Runs in the core initialization, before DMA and interrupts are on. */
+static int b43_nphy_calibrate_initial(struct b43_wldev *dev)
+{
+	struct b43_phy_n *nphy = dev->phy.n;
+	struct b43_nphy_calibration *cal = nphy->calibration;
+	unsigned int i;
+	int err;
+
+	lockdep_assert_held(&dev->wl->mutex);
+	if (b43_status(dev) != B43_STAT_UNINIT ||
+	    !b43_nphy_2057_rev9_2g(dev) || !nphy->ipa2g_on ||
+	    !dev->phy.chandef || (dev->phy.chandef->width != NL80211_CHAN_WIDTH_20 &&
+				 dev->phy.chandef->width != NL80211_CHAN_WIDTH_20_NOHT))
+		return -EOPNOTSUPP;
+	if (!cal) {
+		cal = kzalloc(sizeof(*cal), GFP_KERNEL);
+		if (!cal)
+			return -ENOMEM;
+		nphy->calibration = cal;
+	} else {
+		memset(cal, 0, sizeof(*cal));
+	}
+	cal->stage = "admission";
+	if (!b43_nphy_cal_accessible(dev)) {
+		err = -EIO;
+		goto abort;
+	}
+	for (i = 0; i < ARRAY_SIZE(cal->radio); i++)
+		cal->radio[i] = b43_radio_read(dev, b43_nphy_cal_radio_reg(i));
+	cal->radio_saved = true;
+	if ((b43_phy_read(dev, B43_NPHY_TXPCTL_CMD) & 0xe000) ||
+	    cal->radio[27] || cal->radio[30]) {
+		/* Nothing was written yet: keep the PHY setup and run without
+		 * these corrections, as before they existed. */
+		b43warn(dev->wl, "N-PHY busy (TX power control %04x, radio %04x/%04x); initial calibration skipped\n",
+			b43_phy_read(dev, B43_NPHY_TXPCTL_CMD),
+			cal->radio[27], cal->radio[30]);
+		return 0;
+	}
+	err = b43_nphy_cal_engine_enter(dev, &cal->engine);
+	if (err == -EBUSY && !cal->engine.entered) {
+		/* Its checks only read state too. */
+		b43warn(dev->wl, "N-PHY busy (MAC control %08x, IRQ %08x); initial calibration skipped\n",
+			b43_read32(dev, B43_MMIO_MACCTL),
+			b43_read32(dev, B43_MMIO_GEN_IRQ_REASON));
+		return 0;
+	}
+	if (err)
+		goto abort;
+	cal->stage = "TX IQ/LO";
+	err = b43_nphy_cal_tx(dev, &cal->engine, &cal->tx);
+	if (err)
+		goto abort;
+	cal->stage = "PAPD";
+	err = b43_nphy_cal_papd(dev, &cal->engine, &cal->papd);
+	if (err)
+		goto abort;
+	cal->stage = "RX IQ";
+	err = b43_nphy_cal_rx(dev, &cal->engine, &cal->rx);
+	if (err)
+		goto abort;
+	cal->stage = "release";
+	err = b43_nphy_cal_engine_leave(dev, &cal->engine);
+	if (err)
+		goto abort;
+	b43_nphy_save_cal(dev);
+	cal->valid = true;
+	cal->stage = "complete";
+	return 0;
+
+abort:
+	nphy->txiqlocal_coeffsvalid = false;
+	nphy->iqcal_chanspec_2G.center_freq = 0;
+	b43err(dev->wl, "Initial N-PHY calibration failed at %s: %d\n", cal->stage, err);
+	/* A core reset does not reset these. */
+	if (cal->radio_saved)
+		for (i = 0; i < ARRAY_SIZE(cal->radio); i++)
+			b43_radio_write(dev, b43_nphy_cal_radio_reg(i), cal->radio[i]);
+	return err;
+}
+
 /**************************************************
  * N-PHY init
  **************************************************/
@@ -6057,6 +7490,7 @@ static int b43_phy_initn(struct b43_wldev *dev)
 	u16 tmp;
 	bool do_rssi_cal;
 	bool forced_clock;
+	int err;
 
 	u16 clip[2];
 	bool do_cal = false;
@@ -6240,6 +7674,12 @@ static int b43_phy_initn(struct b43_wldev *dev)
 					if (b43_nphy_cal_rx_iq(dev, target, 2, 0) == 0)
 						b43_nphy_save_cal(dev);
 			} else if (nphy->mphase_cal_phase_id == 0) {
+				if (b43_nphy_2057_rev9_2g(dev) && nphy->ipa2g_on &&
+				    b43_status(dev) == B43_STAT_UNINIT) {
+					err = b43_nphy_calibrate_initial(dev);
+					if (err)
+						return err;
+				}
 				;/* N PHY Periodic Calibration with arg 3 */
 			}
 		} else {
@@ -6506,8 +7946,10 @@ static void b43_nphy_op_prepare_structs(struct b43_wldev *dev)
 	struct b43_phy *phy = &dev->phy;
 	struct b43_phy_n *nphy = phy->n;
 	struct ssb_sprom *sprom = dev->dev->bus_sprom;
+	struct b43_nphy_calibration *calibration = nphy->calibration;
 
 	memset(nphy, 0, sizeof(*nphy));
+	nphy->calibration = calibration;
 
 	nphy->hang_avoid = (phy->rev == 3 || phy->rev == 4);
 	nphy->spur_avoid = (phy->rev >= 3) ?
@@ -6559,6 +8001,7 @@ static void b43_nphy_op_free(struct b43_wldev *dev)
 	struct b43_phy *phy = &dev->phy;
 	struct b43_phy_n *nphy = phy->n;
 
+	kfree(nphy->calibration);
 	kfree(nphy);
 	phy->n = NULL;
 }
