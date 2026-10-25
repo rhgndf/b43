@@ -7273,9 +7273,10 @@ static int b43_nphy_rx_core(struct b43_wldev *dev,
 	err = b43_nphy_cal_engine_measure(dev, engine, 16384, estimate);
 	if (err)
 		return err;
+	/* On this PHY, the formula takes the I and Q powers exchanged. */
 	err = b43_nphy_rx_coefficients(core ? estimate->iq1_prod : estimate->iq0_prod,
-				       core ? estimate->i1_pwr : estimate->i0_pwr,
-				       core ? estimate->q1_pwr : estimate->q0_pwr, &a, &b);
+				       core ? estimate->q1_pwr : estimate->q0_pwr,
+				       core ? estimate->i1_pwr : estimate->i0_pwr, &a, &b);
 	if (err)
 		return err;
 	if (core) {
