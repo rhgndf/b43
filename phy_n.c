@@ -2169,7 +2169,7 @@ static void b43_nphy_rev3_rssi_cal(struct b43_wldev *dev)
 				continue;
 			for (vcm = 0; vcm < 8; vcm++) {
 				currd = results[vcm][i] * results[vcm][i] +
-					results[vcm][i + 1] * results[vcm][i];
+					results[vcm][i + 1] * results[vcm][i + 1];
 				if (currd < mind) {
 					mind = currd;
 					minvcm = vcm;
