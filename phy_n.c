@@ -2516,6 +2516,7 @@ static void b43_nphy_gain_ctl_workarounds_rev7(struct b43_wldev *dev)
 	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_LOGAIN_A, 0x0070);
 	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_LOGAIN_B, 0x0218);
 	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_LOGAIN_B, 0x0218);
+	b43_phy_write(dev, B43_NPHY_TRLOSS, 0x1f02);
 	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_MEDGAIN_A, medgain_a);
 	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_MEDGAIN_A, medgain_a);
 	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_MEDGAIN_B, medgain_b);
@@ -2525,6 +2526,10 @@ static void b43_nphy_gain_ctl_workarounds_rev7(struct b43_wldev *dev)
 	b43_ntab_write_bulk(dev, B43_NTAB8(1, 8), 4, lna1_gain);
 	b43_ntab_write_bulk(dev, B43_NTAB8(0, 16), 4, lna2_gain);
 	b43_ntab_write_bulk(dev, B43_NTAB8(1, 16), 4, lna2_gain);
+
+	/* Pulse this unnamed bit after loading the gains. */
+	b43_phy_set(dev, B43_NPHY_RXCTL, 0x2000);
+	b43_phy_mask(dev, B43_NPHY_RXCTL, ~0x2000);
 }
 
 static void b43_nphy_gain_ctl_workarounds_rev3(struct b43_wldev *dev)
