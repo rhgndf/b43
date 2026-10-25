@@ -8031,6 +8031,26 @@ static void b43_nphy_channel_setup(struct b43_wldev *dev,
 			0x14, 0x14, 0x10, 0x10, 0x05, 0x05, 0x05, 0x01,
 		};
 
+		/* One set of values for channel 13 and another for the rest */
+		static const u16 strnfilt[2][10] = {
+			{ 0xcc, 0x29, 0xcc, 0xfe58, 0x1a2,
+			  0x66, 0x93, 0x66, 0xfdc6, 0xe1 },
+			{ 0xe5, 0x68, 0xe5, 0xfebe, 0x19e,
+			  0x73, 0xb2, 0x73, 0xfdfe, 0xcc },
+		};
+		bool ch13 = ch == 13;
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(strnfilt[0]); i++)
+			b43_phy_write(dev, B43_NPHY_RXSTRNFILT40NUM00 + i,
+				      strnfilt[ch13][i]);
+		b43_phy_write(dev, B43_NPHY_CRSACIDETECTTHRESHL,
+			      ch13 ? 0x55 : 0x3c);
+		b43_phy_write(dev, B43_NPHY_CRSACIDETECTTHRESHU,
+			      ch13 ? 0x55 : 0x3c);
+		b43_ntab_write(dev, B43_NTAB32(16, 0x33), ch13 ? 0x18d : 0x14d);
+		b43_ntab_write(dev, B43_NTAB32(16, 0x35), ch13 ? 0x18d : 0x14d);
+
 		/* Set at 40 MHz only; it helps to receive weak signals. */
 		b43_phy_maskset(dev, 0x324, ~0x100,
 				b43_is_40mhz(dev) ? 0x100 : 0);
