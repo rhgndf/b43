@@ -1278,6 +1278,13 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 			status.signal = max(rxhdr->power1, rxhdr->power2);
 		else
 			status.signal = max(rxhdr->power0, rxhdr->power1);
+		/* The BCM43227 receives on both cores, core 0 first. Frames
+		 * without PHY status carry no power. */
+		if (dev->ht && (macstat & B43_RX_MAC_RXST_VALID)) {
+			status.chains = 0x3;
+			status.chain_signal[0] = rxhdr->power0;
+			status.chain_signal[1] = rxhdr->power1;
+		}
 		break;
 	case B43_PHYTYPE_B:
 	case B43_PHYTYPE_G:
