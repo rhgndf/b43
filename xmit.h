@@ -204,10 +204,28 @@ size_t b43_txhdr_size(struct b43_wldev *dev)
 }
 
 
+/* A-MPDU membership of one generated TX header. */
+struct b43_txhdr_ampdu {
+	bool first;
+	bool last;
+	/* Aggregate PSDU length, including delimiters and padding. */
+	unsigned int len;
+	/* Null delimiters the firmware inserts after this member. */
+	u8 ndelim;
+	/* TX FIFO bytes loaded before the A-MPDU is sent. */
+	u16 preload;
+};
+
 int b43_generate_txhdr(struct b43_wldev *dev,
 		       u8 * txhdr,
 		       struct sk_buff *skb_frag,
-		       struct ieee80211_tx_info *txctl, u16 cookie);
+		       struct ieee80211_tx_info *txctl, u16 cookie,
+		       const struct b43_txhdr_ampdu *ampdu);
+unsigned int b43_tx_psdu_len(struct sk_buff *skb);
+bool b43_ampdu_tx_fits(struct b43_wldev *dev, struct ieee80211_tx_info *info,
+		       unsigned int ampdu_len);
+unsigned int b43_ampdu_tx_spacing(struct b43_wldev *dev,
+				  struct ieee80211_tx_info *info, u8 density);
 
 /* Transmit Status */
 struct b43_txstatus {
@@ -222,6 +240,9 @@ struct b43_txstatus {
 	u8 intermediate;	/* Intermediate status notification (not final) */
 	u8 for_ampdu;		/* Status is for an AMPDU (afterburner) */
 	u8 acked;		/* Wireless ACK received */
+	/* A-MPDU Block Ack, valid only when acked and for_ampdu. */
+	u8 ba_valid;
+	u64 ba_bitmap;		/* Bit n acknowledges sequence (seq >> 4) + n */
 };
 
 /* txstatus supp_reason values */
@@ -353,7 +374,8 @@ u8 b43_plcp_get_ratecode_cck(const u8 bitrate);
 u8 b43_plcp_get_ratecode_ofdm(const u8 bitrate);
 
 void b43_generate_plcp_hdr(struct b43_plcp_hdr4 *plcp,
-			   const u16 octets, const u8 bitrate, bool ht);
+			   const u16 octets, const u8 bitrate, bool ht,
+			   bool aggregate);
 
 void b43_ht_sig_crc_init(void);
 void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr);

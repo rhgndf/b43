@@ -178,6 +178,20 @@ struct b43_dmadesc_generic {
 #define B43_DMA_RX_MAX_FRAME_LEN	(sizeof(struct b43_plcp_hdr6) + \
 					 IEEE80211_MAX_MPDU_LEN_VHT_7991)
 
+/* Driver retransmissions of an unacknowledged A-MPDU member; after
+ * B43_AMPDU_TX_RR_LIMIT of them the member uses its fallback rate. */
+#define B43_AMPDU_TX_RETRY_LIMIT	6
+#define B43_AMPDU_TX_RR_LIMIT		2
+#define B43_AMPDU_TX_MAX_MPDUS		32
+/* A-MPDUs a ring holds before the next one is built */
+#define B43_AMPDU_TX_MAX_PENDING	2
+/* The bytes an A-MPDU loads into the TX FIFO before it is sent grow by
+ * B43_AMPDU_TX_PRELOAD_STEP after every B43_AMPDU_TX_UNDERFLOWS FIFO
+ * underflows, up to the BE FIFO (98 blocks of 256 bytes) less 2048. */
+#define B43_AMPDU_TX_PRELOAD_STEP	1000
+#define B43_AMPDU_TX_UNDERFLOWS		10
+#define B43_AMPDU_TX_MAX_PRELOAD	(98 * 256 - 2048)
+
 /* Pointer poison */
 #define B43_DMA_PTR_POISON		((void *)ERR_PTR(-ENOMEM))
 #define b43_dma_ptr_is_poisoned(ptr)	(unlikely((ptr) == B43_DMA_PTR_POISON))
@@ -194,6 +208,9 @@ struct b43_dmadesc_meta {
 	dma_addr_t dmaaddr;
 	/* ieee80211 TX status. Only used once per 802.11 frag. */
 	bool is_last_fragment;
+	/* TX A-MPDU member, and its last member. */
+	bool ampdu;
+	bool ampdu_last;
 };
 
 struct b43_dmaring;
@@ -259,6 +276,13 @@ struct b43_dmaring {
 	enum b43_dmatype type;
 	/* Boolean. Is this ring stopped at ieee80211 level? */
 	bool stopped;
+	/* Number of A-MPDUs awaiting TX status. */
+	u8 ampdu_pending;
+	/* A-MPDU preload in bytes, the FIFO's underflow counter at its last
+	 * read and the underflows since the preload last grew. */
+	u16 ampdu_preload;
+	u16 txfunfl;
+	u16 txfunfl_new;
 	/* The QOS priority assigned to this ring. Only used for TX rings.
 	 * This is the mac80211 "queue" value. */
 	u8 queue_prio;
@@ -296,6 +320,20 @@ void b43_dma_tx_suspend(struct b43_wldev *dev);
 void b43_dma_tx_resume(struct b43_wldev *dev);
 bool b43_dma_tx_empty(struct b43_wldev *dev);
 
+struct b43_ampdu_tx_tid *b43_dma_ampdu_txq(struct ieee80211_txq *txq);
+struct sk_buff *b43_dma_ampdu_tx_dequeue(struct b43_ampdu_tx_tid *t);
+void b43_dma_ampdu_tx_stop(struct b43_wl *wl, struct b43_ampdu_tx_tid *t,
+			   bool drop);
+void b43_dma_ampdu_tx_sta_ps(struct b43_wl *wl, struct ieee80211_sta *sta,
+			     bool asleep);
+void b43_dma_ampdu_tx_sta_drop(struct b43_wl *wl, struct ieee80211_sta *sta);
+void b43_dma_ampdu_tx_purge(struct b43_wl *wl);
+bool b43_dma_ampdu_tx_queued(struct b43_wl *wl);
+int b43_dma_tx_room(struct b43_wldev *dev, int ac);
+int b43_dma_tx_ampdu(struct b43_wldev *dev, struct ieee80211_txq *txq,
+		     struct b43_ampdu_tx_tid *t);
+void b43_dma_handle_ampdu_txstatus(struct b43_wldev *dev,
+				   const struct b43_txstatus *status);
 int b43_dma_tx(struct b43_wldev *dev,
 	       struct sk_buff *skb);
 void b43_dma_handle_txstatus(struct b43_wldev *dev,

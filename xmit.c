@@ -157,7 +157,8 @@ u8 b43_plcp_get_ratecode_ofdm(const u8 bitrate)
 }
 
 void b43_generate_plcp_hdr(struct b43_plcp_hdr4 *plcp,
-			   const u16 octets, const u8 bitrate, bool ht)
+			   const u16 octets, const u8 bitrate, bool ht,
+			   bool aggregate)
 {
 	__u8 *raw = plcp->raw;
 
@@ -165,6 +166,8 @@ void b43_generate_plcp_hdr(struct b43_plcp_hdr4 *plcp,
 		raw[0] = bitrate;
 		put_unaligned_le16(octets, raw + 1);
 		raw[3] = 0x07; /* Smoothing, not sounding, reserved. */
+		if (aggregate)
+			raw[3] |= 0x08; /* Aggregation */
 	} else if (b43_is_ofdm_rate(bitrate)) {
 		u32 d;
 
@@ -261,17 +264,19 @@ static bool b43_tx_response_short_preamble(struct ieee80211_vif *vif, u8 rate)
 	       b43_is_cck_rate(rate) && rate != B43_CCK_RATE_1MB;
 }
 
+/* The response is a 14-byte ACK, or a 32-byte compressed Block Ack. */
 static unsigned int b43_tx_nav(struct b43_wldev *dev,
 			       struct ieee80211_tx_info *info,
 			       u8 rate, bool ht, bool short_preamble,
-			       unsigned int next_len)
+			       unsigned int next_len, bool block_ack)
 {
 	u8 response = b43_tx_response_rate(dev, info, rate, ht, false);
 	bool response_short_preamble =
 		b43_tx_response_short_preamble(info->control.vif, response);
 	unsigned int sifs = dev->phy.gmode ? 10 : 16;
 	unsigned int nav = sifs + b43_tx_airtime(response, false,
-					response_short_preamble, 14, dev->phy.gmode);
+					response_short_preamble,
+					block_ack ? 32 : 14, dev->phy.gmode);
 
 	if (next_len)
 		nav = 2 * nav + sifs + b43_tx_airtime(rate, ht, short_preamble,
@@ -358,7 +363,8 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		       u8 *_txhdr,
 		       struct sk_buff *skb_frag,
 		       struct ieee80211_tx_info *info,
-		       u16 cookie)
+		       u16 cookie,
+		       const struct b43_txhdr_ampdu *ampdu)
 {
 	const unsigned char *fragment_data = skb_frag->data;
 	unsigned int fragment_len = skb_frag->len;
@@ -374,7 +380,8 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	bool rate_ht = false, rate_fb_ht = false;
 	bool ht, ack, short_preamble, short_preamble_fb;
 	unsigned int fes = 0, fes_fb = 0, next_len = 0;
-	unsigned int plcp_fragment_len;
+	unsigned int plcp_fragment_len, ppdu_len;
+	bool protect = !ampdu || ampdu->first;
 	u32 mac_ctl = 0;
 	u16 phy_ctl = 0;
 	bool fill_phy_ctl1 = (phy->type == B43_PHYTYPE_LP ||
@@ -410,6 +417,9 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	}
 	rate_fb_ofdm = !rate_fb_ht && b43_is_ofdm_rate(rate_fb);
 	ht = rate_ht || rate_fb_ht;
+	/* A-MPDU members use the primary HT rate; the caller checks limits. */
+	if (ampdu && (!rate_ht || (info->flags & IEEE80211_TX_CTL_NO_ACK)))
+		return -EINVAL;
 	short_preamble = !rate_ht &&
 		(info->control.rates[0].flags & IEEE80211_TX_RC_USE_SHORT_PREAMBLE);
 	short_preamble_fb = !rate_fb_ht && !rate_fb_ofdm &&
@@ -496,41 +506,51 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		if (ieee80211_has_morefrags(fctl))
 			next_len = plcp_fragment_len;
 		wlhdr->duration_id = cpu_to_le16(ack ?
-			b43_tx_nav(dev, info, rate, rate_ht, short_preamble, next_len) : 0);
+			b43_tx_nav(dev, info, rate, rate_ht, short_preamble,
+				   next_len, ampdu) : 0);
 		txhdr->dur_fb = cpu_to_le16(ack ?
 			b43_tx_nav(dev, info, rate_fb, rate_fb_ht,
-				   short_preamble_fb, next_len) : 0);
+				   short_preamble_fb, next_len, ampdu) : 0);
 	}
+	/* The first header describes the whole A-MPDU PPDU. Continuation
+	 * PLCP and mixed-mode lengths stay individual. */
+	ppdu_len = ampdu && ampdu->first ? ampdu->len : plcp_fragment_len;
 	switch (dev->fw.hdr_format) {
 	case B43_FW_HDR_598:
 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_598.plcp),
-				      plcp_fragment_len, rate, rate_ht);
+				      ppdu_len, rate, rate_ht,
+				      ampdu && ampdu->first);
 		break;
 	case B43_FW_HDR_351:
 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_351.plcp),
-				      plcp_fragment_len, rate, rate_ht);
+				      plcp_fragment_len, rate, rate_ht,
+				      ampdu && ampdu->first);
 		break;
 	case B43_FW_HDR_410:
 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_410.plcp),
-				      plcp_fragment_len, rate, rate_ht);
+				      plcp_fragment_len, rate, rate_ht,
+				      ampdu && ampdu->first);
 		break;
 	}
 	b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->plcp_fb),
-			      plcp_fragment_len, rate_fb, rate_fb_ht);
+			      plcp_fragment_len, rate_fb, rate_fb_ht, false);
+	if (ampdu && ampdu->first)
+		txhdr->format_598.preload_size = cpu_to_le16(ampdu->preload);
 	if (rate_ht)
 		txhdr->mimo_modelen = cpu_to_le16(3 *
-			(b43_ht20_symbols(rate, plcp_fragment_len) + (rate >> 3) + 4) - 3);
+			(b43_ht20_symbols(rate, ppdu_len) + (rate >> 3) + 4) - 3);
 	if (rate_fb_ht)
 		txhdr->mimo_ratelen_fb = cpu_to_le16(3 *
-			(b43_ht20_symbols(rate_fb, plcp_fragment_len) + (rate_fb >> 3) + 4) - 3);
+			(b43_ht20_symbols(rate_fb, ppdu_len) + (rate_fb >> 3) + 4) - 3);
 	if (ht) {
 		fes = b43_tx_airtime(rate, rate_ht, short_preamble,
-				     plcp_fragment_len, phy->gmode) +
-		      (ack ? b43_tx_nav(dev, info, rate, rate_ht, short_preamble, 0) : 0);
+				     ppdu_len, phy->gmode) +
+		      (ack ? b43_tx_nav(dev, info, rate, rate_ht, short_preamble,
+					0, ampdu) : 0);
 		fes_fb = b43_tx_airtime(rate_fb, rate_fb_ht, short_preamble_fb,
-					plcp_fragment_len, phy->gmode) +
+					ppdu_len, phy->gmode) +
 			 (ack ? b43_tx_nav(dev, info, rate_fb, rate_fb_ht,
-					  short_preamble_fb, 0) : 0);
+					  short_preamble_fb, 0, ampdu) : 0);
 	}
 
 	/* Extra Frame Types */
@@ -578,7 +598,7 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	}
 
 	rates = info->control.rates;
-	if (ht && vif && ack) {
+	if (ht && protect && vif && ack) {
 		u16 ht_prot = vif->bss_conf.ht_operation_mode &
 			      IEEE80211_HT_OP_MODE_PROTECTION;
 
@@ -595,8 +615,15 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	/* use hardware sequence counter as the non-TID counter */
 	if (info->flags & IEEE80211_TX_CTL_ASSIGN_SEQ)
 		mac_ctl |= B43_TXH_MAC_HWSEQ;
-	if (info->flags & IEEE80211_TX_CTL_FIRST_FRAGMENT)
+	if ((info->flags & IEEE80211_TX_CTL_FIRST_FRAGMENT) &&
+	    (!ampdu || ampdu->first))
 		mac_ctl |= B43_TXH_MAC_STMSDU;
+	if (ampdu && ampdu->last)
+		mac_ctl |= B43_TXH_MAC_AMPDU_LAST;
+	else if (ampdu && ampdu->first)
+		mac_ctl |= B43_TXH_MAC_AMPDU_FIRST;
+	else if (ampdu)
+		mac_ctl |= B43_TXH_MAC_AMPDU_INTER;
 	if (!phy->gmode)
 		mac_ctl |= B43_TXH_MAC_5GHZ;
 	if (short_preamble_fb)
@@ -614,9 +641,11 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		rates[0].count = B43_SHORT_FALLBACK_LIMIT;
 	}
 
-	/* Generate the RTS or CTS-to-self frame */
-	if ((rates[0].flags & IEEE80211_TX_RC_USE_RTS_CTS) ||
-	    (rates[0].flags & IEEE80211_TX_RC_USE_CTS_PROTECT)) {
+	/* Generate the RTS or CTS-to-self frame. Only the first A-MPDU
+	 * member's protection precedes the PPDU. */
+	if (protect &&
+	    ((rates[0].flags & IEEE80211_TX_RC_USE_RTS_CTS) ||
+	     (rates[0].flags & IEEE80211_TX_RC_USE_CTS_PROTECT))) {
 		unsigned int len;
 		struct ieee80211_hdr *hdr;
 		int rts_rate, rts_rate_fb;
@@ -712,10 +741,10 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 			break;
 		}
 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)plcp,
-				      len, rts_rate, false);
+				      len, rts_rate, false, false);
 		plcp = &txhdr->rts_plcp_fb;
 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)plcp,
-				      len, rts_rate_fb, false);
+				      len, rts_rate_fb, false, false);
 
 		switch (dev->fw.hdr_format) {
 		case B43_FW_HDR_598:
@@ -781,6 +810,10 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 				b43_generate_tx_phy_ctl1(dev, rts_rate_fb, false));
 		}
 	}
+	/* brcmsmac's AMPDU_FBR_NULL_DELIM; a legacy RTS fallback PLCP only
+	 * uses bytes 0-3. */
+	if (ampdu)
+		txhdr->rts_plcp_fb.raw[5] = ampdu->ndelim;
 	if (ht && ieee80211_is_data_qos(fctl) &&
 	    skb_get_queue_mapping(skb_frag) < B43_QOS_QUEUE_NUM &&
 	    dev->wl->qos_params[skb_get_queue_mapping(skb_frag)].p.txop) {
@@ -814,6 +847,39 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	txhdr->extra_ft = extra_ft;
 
 	return 0;
+}
+
+/* On-air PSDU length of a TX frame: hardware appends ICV and FCS. */
+unsigned int b43_tx_psdu_len(struct sk_buff *skb)
+{
+	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+	unsigned int len = skb->len + FCS_LEN;
+
+	if (info->control.hw_key)
+		len += info->control.hw_key->icv_len;
+	return len;
+}
+
+/* The mixed-mode L-SIG length field limits the HT PPDU duration. */
+bool b43_ampdu_tx_fits(struct b43_wldev *dev, struct ieee80211_tx_info *info,
+		       unsigned int ampdu_len)
+{
+	u8 mcs = info->control.rates[0].idx;
+
+	return 3 * (b43_ht20_symbols(mcs, ampdu_len) + (mcs >> 3) + 4) - 3 <= 4095;
+}
+
+/* Minimum bytes from one MPDU start to the next for the peer's density
+ * code: spacing 2^(density - 3) microseconds, none for zero. */
+unsigned int b43_ampdu_tx_spacing(struct b43_wldev *dev,
+				  struct ieee80211_tx_info *info, u8 density)
+{
+	u8 mcs = info->control.rates[0].idx;
+
+	if (!density)
+		return 0;
+	return DIV_ROUND_UP((1 << density) * b43_ht20_ndbps[mcs & 7] *
+			    (1 + (mcs >> 3)), 8 * 8 * 4);
 }
 
 static s8 b43_rssi_postprocess(struct b43_wldev *dev,
@@ -1174,9 +1240,11 @@ void b43_handle_txstatus(struct b43_wldev *dev,
 {
 	b43_debugfs_log_txstat(dev, status);
 
-	if (status->intermediate)
+	if (status->for_ampdu) {
+		b43_dma_handle_ampdu_txstatus(dev, status);
 		return;
-	if (status->for_ampdu)
+	}
+	if (status->intermediate)
 		return;
 	if (!status->acked)
 		dev->wl->ieee_stats.dot11ACKFailureCount++;

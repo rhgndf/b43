@@ -275,6 +275,8 @@ enum {
 #define B43_SHM_SH_JSSI0		0x0088	/* Measure JSSI 0 */
 #define B43_SHM_SH_JSSI1		0x008A	/* Measure JSSI 1 */
 #define B43_SHM_SH_JSSIAUX		0x008C	/* Measure JSSI AUX */
+/* SHM_SHARED microcode statistics */
+#define B43_SHM_SH_TXFUNFL		0x00EC	/* TX FIFO underflows, one per FIFO */
 /* SHM_SHARED crypto engine */
 #define B43_SHM_SH_DEFAULTIV		0x003C	/* Default IV location */
 #define B43_SHM_SH_NRRXTRANS		0x003E	/* # of soft RX transmitter addresses (max 8) */
@@ -857,6 +859,9 @@ struct b43_wldev {
 	u16 rx_ht_channel;
 	u8 rx_ht_plcp[6];
 	bool rx_ht_valid;
+	/* Acked A-MPDU TX status awaiting its Block Ack bitmap package. */
+	u32 ampdu_txstat[2];
+	bool ampdu_txstat_pending;
 
 	/* PHY/Radio device. */
 	struct b43_phy phy;
@@ -909,6 +914,30 @@ struct b43_wldev {
 	unsigned int tx_count;
 	unsigned int rx_count;
 #endif
+};
+
+/* TX A-MPDU state of one TID of a station, protected by wl->mutex. */
+#define B43_AMPDU_TX_WINDOW	64
+struct b43_ampdu_tx_tid {
+	bool operational;
+	/* Negotiated reorder window, at most B43_AMPDU_TX_WINDOW. */
+	u8 buf_size;
+	/* Oldest unresolved sequence and the unresolved set relative to it. */
+	u16 win_start;
+	u64 outstanding;
+	/* Driver retransmissions, indexed by sequence modulo the window. */
+	u8 retries[B43_AMPDU_TX_WINDOW];
+	/* Retransmissions and frames taken from mac80211 that wait for the
+	 * next A-MPDU, in sequence order. Empty unless operational. */
+	struct sk_buff_head queue;
+};
+
+struct b43_sta {
+	struct b43_ampdu_tx_tid ampdu_tx[IEEE80211_NUM_TIDS];
+	u32 ampdu_tx_max_len;
+	u8 ampdu_tx_density;
+	/* Whether the station of an AP dozes. */
+	bool asleep;
 };
 
 /* Data structure for the WLAN parts (802.11 cores) of the b43 chip. */
