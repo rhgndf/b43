@@ -2481,9 +2481,42 @@ static void b43_nphy_gain_ctl_workarounds_rev19(struct b43_wldev *dev)
 	/* TODO */
 }
 
+/* Radio 2057 rev 9 in the 2.4 GHz band */
+static bool b43_nphy_2057_rev9_2g(struct b43_wldev *dev)
+{
+	struct b43_phy *phy = &dev->phy;
+
+	return phy->rev >= 7 && phy->radio_rev == 9 &&
+		b43_current_band(dev->wl) == NL80211_BAND_2GHZ;
+}
+
 static void b43_nphy_gain_ctl_workarounds_rev7(struct b43_wldev *dev)
 {
-	/* TODO - should depend on phy->rev */
+	static const s8 lna1_gain[] = { 9, 14, 18, 24 };
+	static const s8 lna2_gain[] = { -2, 7, 11, 16 };
+
+	if (!b43_nphy_2057_rev9_2g(dev))
+		return;
+
+	b43_phy_set(dev, B43_NPHY_C1_CGAINI, B43_NPHY_C1_CGAINI_CL2DETECT);
+	b43_phy_set(dev, B43_NPHY_C2_CGAINI, B43_NPHY_C2_CGAINI_CL2DETECT);
+	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWER0, 0xff00, 0x50);
+	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWERU0, 0xff00, 0x50);
+	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWERL0, 0xff00, 0x50);
+
+	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_LOGAIN_A, 0x0070);
+	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_LOGAIN_A, 0x0070);
+	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_LOGAIN_B, 0x0218);
+	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_LOGAIN_B, 0x0218);
+	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_MEDGAIN_A, 0x0062);
+	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_MEDGAIN_A, 0x0062);
+	b43_phy_write(dev, B43_NPHY_REV3_C1_CLIP_MEDGAIN_B, 0x0034);
+	b43_phy_write(dev, B43_NPHY_REV3_C2_CLIP_MEDGAIN_B, 0x0034);
+
+	b43_ntab_write_bulk(dev, B43_NTAB8(0, 8), 4, lna1_gain);
+	b43_ntab_write_bulk(dev, B43_NTAB8(1, 8), 4, lna1_gain);
+	b43_ntab_write_bulk(dev, B43_NTAB8(0, 16), 4, lna2_gain);
+	b43_ntab_write_bulk(dev, B43_NTAB8(1, 16), 4, lna2_gain);
 }
 
 static void b43_nphy_gain_ctl_workarounds_rev3(struct b43_wldev *dev)
@@ -4254,7 +4287,8 @@ static void b43_nphy_tx_gain_table_upload(struct b43_wldev *dev)
 		if (!rf_pwr_offset_table)
 			return;
 		/* TODO: Enable this once we have gains configured */
-		return;
+		if (!b43_nphy_2057_rev9_2g(dev))
+			return;
 	}
 
 	for (i = 0; i < 128; i++) {
