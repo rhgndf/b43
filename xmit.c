@@ -531,8 +531,7 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		else
 			extra_ft |= B43_TXH_EFT_RTSFB_CCK;
 
-		if (rates[0].flags & IEEE80211_TX_RC_USE_RTS_CTS &&
-		    fill_phy_ctl1) {
+		if (fill_phy_ctl1) {
 			txhdr->phy_ctl1_rts = cpu_to_le16(
 				b43_generate_tx_phy_ctl1(dev, rts_rate));
 			txhdr->phy_ctl1_rts_fb = cpu_to_le16(
