@@ -2221,7 +2221,7 @@ static void b43_nphy_rev3_rssi_cal(struct b43_wldev *dev)
 				if (j / 2 == core) {
 					offset[j] = 232 - poll_results[j];
 					if (offset[j] < 0)
-						offset[j] = -(abs(offset[j] + 4) / 8);
+						offset[j] = -((abs(offset[j]) + 4) / 8);
 					else
 						offset[j] = (offset[j] + 4) / 8;
 					b43_nphy_scale_offset_rssi(dev, 0,
