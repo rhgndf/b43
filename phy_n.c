@@ -2186,7 +2186,7 @@ static void b43_nphy_rev3_rssi_cal(struct b43_wldev *dev)
 			b43_radio_maskset(dev,
 					  core ? R2057_NB_MASTER_CORE1 :
 						 R2057_NB_MASTER_CORE0,
-					  ~R2057_VCM_MASK, vcm);
+					  ~R2057_VCM_MASK, vcm_final);
 		else
 			b43_radio_maskset(dev, r | B2056_RX_RSSI_MISC,
 					  0xE3, vcm_final << 2);
