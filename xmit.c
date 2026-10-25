@@ -296,7 +296,8 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		int wlhdr_len;
 		size_t iv_len;
 
-		B43_WARN_ON(key_idx >= ARRAY_SIZE(dev->key));
+		if (B43_WARN_ON(key_idx >= ARRAY_SIZE(dev->key)))
+			return -ENOKEY;
 		key = &(dev->key[key_idx]);
 
 		if (unlikely(!key->keyconf)) {
