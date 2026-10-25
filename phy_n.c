@@ -8021,10 +8021,24 @@ static void b43_nphy_channel_setup(struct b43_wldev *dev,
 
 	b43_phy_write(dev, B43_NPHY_NDATAT_DUP40, 0x3830);
 
-	/* Set at 40 MHz only; it helps to receive weak signals. */
-	if (phy->rev == 16)
+	if (phy->rev == 16) {
+		/* Noise variances */
+		static const u32 nvar20[] = {
+			0x14, 0x14, 0x14, 0x14, 0x15, 0x0d, 0x05, 0x05,
+			0x14, 0x14, 0x10, 0x10, 0x05, 0x05, 0x05, 0x05,
+		};
+		static const u32 nvar40[] = {
+			0x14, 0x20, 0x1d, 0x19, 0x15, 0x0d, 0x05, 0x05,
+			0x14, 0x14, 0x10, 0x10, 0x05, 0x05, 0x05, 0x01,
+		};
+
+		/* Set at 40 MHz only; it helps to receive weak signals. */
 		b43_phy_maskset(dev, 0x324, ~0x100,
 				b43_is_40mhz(dev) ? 0x100 : 0);
+		b43_ntab_write_bulk(dev, B43_NTAB32(16, 0x100),
+				    ARRAY_SIZE(nvar20),
+				    b43_is_40mhz(dev) ? nvar40 : nvar20);
+	}
 
 	if (phy->rev >= 3)
 		b43_nphy_spur_workaround(dev);
