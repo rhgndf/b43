@@ -1437,12 +1437,13 @@ static void dma_tx_wake(struct b43_wldev *dev, struct b43_dmaring *ring)
 }
 
 /* Null delimiters after an MPDU so that the next one starts at least
- * spacing bytes after it. */
+ * spacing bytes after it. At most 63: with more, the hardware reports a TX
+ * PHY error. At 40 MHz a short MPDU can need more. */
 static u8 b43_ampdu_tx_ndelim(unsigned int mpdu, unsigned int spacing)
 {
 	unsigned int start = 4 + ALIGN(mpdu, 4);
 
-	return spacing > start ? DIV_ROUND_UP(spacing - start, 4) : 0;
+	return spacing > start ? min(DIV_ROUND_UP(spacing - start, 4), 63U) : 0;
 }
 
 /* Whether a frame of an aggregating TX queue may join an A-MPDU. */

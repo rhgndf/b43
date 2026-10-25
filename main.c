@@ -1619,7 +1619,7 @@ static void b43_write_template_common(struct b43_wldev *dev,
 
 	plcp.data = 0;
 	b43_generate_plcp_hdr(&plcp, size + FCS_LEN, rate, false, false,
-			      false);
+			      false, false);
 	b43_ram_write(dev, ram_offset, le32_to_cpu(plcp.data));
 	ram_offset += sizeof(u32);
 	/* The PLCP is 6 bytes long, but we only wrote 4 bytes, yet.
@@ -6153,12 +6153,14 @@ static int b43_setup_bands(struct b43_wldev *dev,
 		ht->ht_supported = true;
 		/* Both RX chains stay awake. */
 		ht->cap = IEEE80211_HT_CAP_SM_PS | IEEE80211_HT_CAP_SGI_20 |
-			  IEEE80211_HT_CAP_MAX_AMSDU;
+			  IEEE80211_HT_CAP_MAX_AMSDU |
+			  IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
+			  IEEE80211_HT_CAP_SGI_40 | IEEE80211_HT_CAP_DSSSCCK40;
 		ht->ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K;
 		ht->ampdu_density = IEEE80211_HT_MPDU_DENSITY_4;
 		ht->mcs.rx_mask[0] = 0xff;
 		ht->mcs.rx_mask[1] = 0xff;
-		ht->mcs.rx_highest = cpu_to_le16(144);
+		ht->mcs.rx_highest = cpu_to_le16(300);
 		ht->mcs.tx_params = IEEE80211_HT_MCS_TX_DEFINED;
 		ieee80211_hw_set(hw, AMPDU_AGGREGATION);
 		hw->max_rx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF_HT;

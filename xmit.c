@@ -158,12 +158,14 @@ u8 b43_plcp_get_ratecode_ofdm(const u8 bitrate)
 
 void b43_generate_plcp_hdr(struct b43_plcp_hdr4 *plcp,
 			   const u16 octets, const u8 bitrate, bool ht,
-			   bool sgi, bool aggregate)
+			   bool bw40, bool sgi, bool aggregate)
 {
 	__u8 *raw = plcp->raw;
 
 	if (ht) {
 		raw[0] = bitrate;
+		if (bw40)
+			raw[0] |= 0x80; /* 40 MHz */
 		put_unaligned_le16(octets, raw + 1);
 		raw[3] = 0x07; /* Smoothing, not sounding, reserved. */
 		if (aggregate)
@@ -195,35 +197,40 @@ void b43_generate_plcp_hdr(struct b43_plcp_hdr4 *plcp,
 	}
 }
 
-/* MCS 0-7 with BCC at 20 MHz, from brcmsmac's MCS table */
+/* MCS 0-7 with BCC, from brcmsmac's MCS table */
 static const u16 b43_ht20_ndbps[8] = { 26, 52, 78, 104, 156, 208, 234, 260 };
+static const u16 b43_ht40_ndbps[8] = { 54, 108, 162, 216, 324, 432, 486, 540 };
 static const u16 b43_ht20_phyctl[8] = {
 	0x0000, 0x0800, 0x0a00, 0x1000, 0x1200, 0x1900, 0x1a00, 0x1c00,
 };
 
-static unsigned int b43_ht20_symbols(u8 mcs, unsigned int octets)
+/* Data bits per symbol */
+static unsigned int b43_ht_ndbps(u8 mcs, bool bw40)
 {
-	return DIV_ROUND_UP(16 + 8 * octets + 6,
-			    b43_ht20_ndbps[mcs & 7] * (1 + (mcs >> 3)));
+	return (bw40 ? b43_ht40_ndbps : b43_ht20_ndbps)[mcs & 7] *
+	       (1 + (mcs >> 3));
 }
 
 /* Data duration in 4 us periods: 802.11n rounds short-GI (3.6 us)
  * symbols up to a 4 us boundary for TXTIME and the L-SIG length. */
-static unsigned int b43_ht20_periods(u8 mcs, unsigned int octets, bool sgi)
+static unsigned int b43_ht_periods(u8 mcs, bool bw40, unsigned int octets,
+				   bool sgi)
 {
-	unsigned int symbols = b43_ht20_symbols(mcs, octets);
+	unsigned int symbols = DIV_ROUND_UP(16 + 8 * octets + 6,
+					    b43_ht_ndbps(mcs, bw40));
 
 	return sgi ? DIV_ROUND_UP(9 * symbols, 10) : symbols;
 }
 
 /* Airtime includes the FCS/trailer in octets, but not SIFS. For HT rates
  * short_preamble selects the short guard interval. */
-static unsigned int b43_tx_airtime(u8 rate, bool ht, bool short_preamble,
-				    unsigned int octets, bool gmode)
+static unsigned int b43_tx_airtime(u8 rate, bool ht, bool bw40,
+				   bool short_preamble, unsigned int octets,
+				   bool gmode)
 {
 	if (ht)
 		return 36 + 4 * (rate >> 3) +
-		       4 * b43_ht20_periods(rate, octets, short_preamble) +
+		       4 * b43_ht_periods(rate, bw40, octets, short_preamble) +
 		       (gmode ? 6 : 0);
 	if (b43_is_ofdm_rate(rate))
 		return 20 + 4 * DIV_ROUND_UP(16 + 8 * octets + 6,
@@ -279,34 +286,42 @@ static bool b43_tx_response_short_preamble(struct ieee80211_vif *vif, u8 rate)
 /* The response is a 14-byte ACK, or a 32-byte compressed Block Ack. */
 static unsigned int b43_tx_nav(struct b43_wldev *dev,
 			       struct ieee80211_tx_info *info,
-			       u8 rate, bool ht, bool short_preamble,
+			       u8 rate, bool ht, bool bw40, bool short_preamble,
 			       unsigned int next_len, bool block_ack)
 {
 	u8 response = b43_tx_response_rate(dev, info, rate, ht, false);
 	bool response_short_preamble =
 		b43_tx_response_short_preamble(info->control.vif, response);
 	unsigned int sifs = dev->phy.gmode ? 10 : 16;
-	unsigned int nav = sifs + b43_tx_airtime(response, false,
+	unsigned int nav = sifs + b43_tx_airtime(response, false, false,
 					response_short_preamble,
 					block_ack ? 32 : 14, dev->phy.gmode);
 
 	if (next_len)
-		nav = 2 * nav + sifs + b43_tx_airtime(rate, ht, short_preamble,
-						     next_len, dev->phy.gmode);
+		nav = 2 * nav + sifs + b43_tx_airtime(rate, ht, bw40,
+						     short_preamble, next_len,
+						     dev->phy.gmode);
 	return nav;
 }
 
 /* TODO: verify if needed for SSLPN or LCN  */
-static u16 b43_generate_tx_phy_ctl1(struct b43_wldev *dev, u8 bitrate, bool ht)
+static u16 b43_generate_tx_phy_ctl1(struct b43_wldev *dev, u8 bitrate, bool ht,
+				    bool bw40)
 {
 	const struct b43_phy *phy = &dev->phy;
 	const struct b43_tx_legacy_rate_phy_ctl_entry *e;
 	u16 control = 0;
 	u16 bw;
 
-	if (phy->type == B43_PHYTYPE_LP)
+	/* On a 40 MHz channel, send 20 MHz frames on the control channel, and
+	 * legacy ones at 40 MHz (an RTS or CTS) on both halves. */
+	if (!b43_is_40mhz(dev))
 		bw = B43_TXH_PHY1_BW_20;
-	else /* FIXME */
+	else if (bw40)
+		bw = ht ? B43_TXH_PHY1_BW_40 : B43_TXH_PHY1_BW_40DUP;
+	else if (phy->chandef->chan->center_freq > phy->chandef->center_freq1)
+		bw = B43_TXH_PHY1_BW_20U;
+	else
 		bw = B43_TXH_PHY1_BW_20;
 
 	if (ht) {
@@ -391,6 +406,7 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	int rate_ofdm, rate_fb_ofdm;
 	bool rate_ht = false, rate_fb_ht = false;
 	bool ht, ack, short_preamble, short_preamble_fb, sgi, sgi_fb;
+	bool bw40, bw40_fb;
 	unsigned int fes = 0, fes_fb = 0, next_len = 0;
 	unsigned int plcp_fragment_len, ppdu_len;
 	bool protect = !ampdu || ampdu->first;
@@ -445,6 +461,11 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	sgi_fb = rate_fb_ht &&
 		(info->control.rates[info->control.rates[1].idx < 0 ? 0 : 1].flags &
 		 IEEE80211_TX_RC_SHORT_GI);
+	bw40 = rate_ht && b43_is_40mhz(dev) &&
+		(info->control.rates[0].flags & IEEE80211_TX_RC_40_MHZ_WIDTH);
+	bw40_fb = rate_fb_ht && b43_is_40mhz(dev) &&
+		(info->control.rates[info->control.rates[1].idx < 0 ? 0 : 1].flags &
+		 IEEE80211_TX_RC_40_MHZ_WIDTH);
 
 	if (rate_ht)
 		txhdr->phy_rate = rate;
@@ -524,10 +545,10 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		if (ieee80211_has_morefrags(fctl))
 			next_len = plcp_fragment_len;
 		wlhdr->duration_id = cpu_to_le16(ack ?
-			b43_tx_nav(dev, info, rate, rate_ht, short_preamble || sgi,
-				   next_len, ampdu) : 0);
+			b43_tx_nav(dev, info, rate, rate_ht, bw40,
+				   short_preamble || sgi, next_len, ampdu) : 0);
 		txhdr->dur_fb = cpu_to_le16(ack ?
-			b43_tx_nav(dev, info, rate_fb, rate_fb_ht,
+			b43_tx_nav(dev, info, rate_fb, rate_fb_ht, bw40_fb,
 				   short_preamble_fb || sgi_fb, next_len, ampdu) : 0);
 	}
 	/* The first header describes the whole A-MPDU PPDU. Continuation
@@ -536,40 +557,42 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	switch (dev->fw.hdr_format) {
 	case B43_FW_HDR_598:
 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_598.plcp),
-				      ppdu_len, rate, rate_ht, sgi,
+				      ppdu_len, rate, rate_ht, bw40, sgi,
 				      ampdu && ampdu->first);
 		break;
 	case B43_FW_HDR_351:
 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_351.plcp),
-				      plcp_fragment_len, rate, rate_ht, sgi,
-				      ampdu && ampdu->first);
+				      plcp_fragment_len, rate, rate_ht, bw40,
+				      sgi, ampdu && ampdu->first);
 		break;
 	case B43_FW_HDR_410:
 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_410.plcp),
-				      plcp_fragment_len, rate, rate_ht, sgi,
-				      ampdu && ampdu->first);
+				      plcp_fragment_len, rate, rate_ht, bw40,
+				      sgi, ampdu && ampdu->first);
 		break;
 	}
 	b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->plcp_fb),
-			      plcp_fragment_len, rate_fb, rate_fb_ht, sgi_fb,
-			      false);
+			      plcp_fragment_len, rate_fb, rate_fb_ht, bw40_fb,
+			      sgi_fb, false);
 	if (ampdu && ampdu->first)
 		txhdr->format_598.preload_size = cpu_to_le16(ampdu->preload);
 	if (rate_ht)
 		txhdr->mimo_modelen = cpu_to_le16(3 *
-			(b43_ht20_periods(rate, ppdu_len, sgi) + (rate >> 3) + 4) - 3);
+			(b43_ht_periods(rate, bw40, ppdu_len, sgi) +
+			 (rate >> 3) + 4) - 3);
 	if (rate_fb_ht)
 		txhdr->mimo_ratelen_fb = cpu_to_le16(3 *
-			(b43_ht20_periods(rate_fb, ppdu_len, sgi_fb) +
+			(b43_ht_periods(rate_fb, bw40_fb, ppdu_len, sgi_fb) +
 			 (rate_fb >> 3) + 4) - 3);
 	if (ht) {
-		fes = b43_tx_airtime(rate, rate_ht, short_preamble || sgi,
+		fes = b43_tx_airtime(rate, rate_ht, bw40, short_preamble || sgi,
 				     ppdu_len, phy->gmode) +
-		      (ack ? b43_tx_nav(dev, info, rate, rate_ht, short_preamble || sgi,
-					0, ampdu) : 0);
-		fes_fb = b43_tx_airtime(rate_fb, rate_fb_ht, short_preamble_fb || sgi_fb,
+		      (ack ? b43_tx_nav(dev, info, rate, rate_ht, bw40,
+					short_preamble || sgi, 0, ampdu) : 0);
+		fes_fb = b43_tx_airtime(rate_fb, rate_fb_ht, bw40_fb,
+					short_preamble_fb || sgi_fb,
 					ppdu_len, phy->gmode) +
-			 (ack ? b43_tx_nav(dev, info, rate_fb, rate_fb_ht,
+			 (ack ? b43_tx_nav(dev, info, rate_fb, rate_fb_ht, bw40_fb,
 					  short_preamble_fb || sgi_fb, 0, ampdu) : 0);
 	}
 
@@ -585,7 +608,8 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	 * this value before comparing it to the value in SHM, if this
 	 * is a 5Ghz packet.
 	 */
-	txhdr->chan_radio_code = phy->channel;
+	txhdr->chan_radio_code = b43_is_40mhz(dev) ?
+		b43_phy_center_channel(dev) : phy->channel;
 
 	/* PHY TX Control word */
 	if (rate_ht)
@@ -626,7 +650,9 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		 * HT stations cannot receive. */
 		if (vif->bss_conf.use_cts_prot ||
 		    ht_prot == IEEE80211_HT_OP_MODE_PROTECTION_NONMEMBER ||
-		    ht_prot == IEEE80211_HT_OP_MODE_PROTECTION_NONHT_MIXED)
+		    ht_prot == IEEE80211_HT_OP_MODE_PROTECTION_NONHT_MIXED ||
+		    (ht_prot == IEEE80211_HT_OP_MODE_PROTECTION_20MHZ &&
+		     (bw40 || bw40_fb)))
 			rates[0].flags |= IEEE80211_TX_RC_USE_RTS_CTS;
 	}
 	/* As brcmsmac does, protect an HT PPDU when any retry stage asks for
@@ -658,6 +684,8 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 		mac_ctl |= B43_TXH_MAC_AMPDU_INTER;
 	if (!phy->gmode)
 		mac_ctl |= B43_TXH_MAC_5GHZ;
+	if (b43_is_40mhz(dev))
+		mac_ctl |= B43_TXH_MAC_40MHZ;
 	if (short_preamble_fb)
 		mac_ctl |= B43_TXH_MAC_FB_SHORTPRMBL;
 
@@ -773,10 +801,12 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 			break;
 		}
 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)plcp,
-				      len, rts_rate, false, false, false);
+				      len, rts_rate, false, false, false,
+				      false);
 		plcp = &txhdr->rts_plcp_fb;
 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)plcp,
-				      len, rts_rate_fb, false, false, false);
+				      len, rts_rate_fb, false, false, false,
+				      false);
 
 		switch (dev->fw.hdr_format) {
 		case B43_FW_HDR_598:
@@ -808,16 +838,16 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 			if (rts_short_preamble_fb)
 				mac_ctl |= B43_TXH_MAC_RTS_FB_SHORTPRMBL;
 			if (!(rates[0].flags & IEEE80211_TX_RC_USE_CTS_PROTECT)) {
-				nav += sifs + b43_tx_airtime(rts_rate, false,
+				nav += sifs + b43_tx_airtime(rts_rate, false, false,
 							rts_short_preamble, 14, phy->gmode);
-				nav_fb += sifs + b43_tx_airtime(rts_rate_fb, false,
+				nav_fb += sifs + b43_tx_airtime(rts_rate_fb, false, false,
 							rts_short_preamble_fb, 14, phy->gmode);
 			}
 			hdr->duration_id = cpu_to_le16(nav);
 			txhdr->rts_dur_fb = cpu_to_le16(nav_fb);
-			fes = nav + b43_tx_airtime(rts_rate, false,
+			fes = nav + b43_tx_airtime(rts_rate, false, false,
 						  rts_short_preamble, len, phy->gmode);
-			fes_fb = nav_fb + b43_tx_airtime(rts_rate_fb, false,
+			fes_fb = nav_fb + b43_tx_airtime(rts_rate_fb, false, false,
 							rts_short_preamble_fb, len, phy->gmode);
 		}
 
@@ -837,9 +867,11 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 
 		if (fill_phy_ctl1) {
 			txhdr->phy_ctl1_rts = cpu_to_le16(
-				b43_generate_tx_phy_ctl1(dev, rts_rate, false));
+				b43_generate_tx_phy_ctl1(dev, rts_rate, false,
+							 bw40 && rts_rate_ofdm));
 			txhdr->phy_ctl1_rts_fb = cpu_to_le16(
-				b43_generate_tx_phy_ctl1(dev, rts_rate_fb, false));
+				b43_generate_tx_phy_ctl1(dev, rts_rate_fb, false,
+							 bw40_fb && rts_rate_fb_ofdm));
 		}
 	}
 	/* brcmsmac's AMPDU_FBR_NULL_DELIM; a legacy RTS fallback PLCP only
@@ -867,10 +899,10 @@ int b43_generate_txhdr(struct b43_wldev *dev,
 	}
 
 	if (fill_phy_ctl1) {
-		txhdr->phy_ctl1 =
-			cpu_to_le16(b43_generate_tx_phy_ctl1(dev, rate, rate_ht));
-		txhdr->phy_ctl1_fb =
-			cpu_to_le16(b43_generate_tx_phy_ctl1(dev, rate_fb, rate_fb_ht));
+		txhdr->phy_ctl1 = cpu_to_le16(
+			b43_generate_tx_phy_ctl1(dev, rate, rate_ht, bw40));
+		txhdr->phy_ctl1_fb = cpu_to_le16(
+			b43_generate_tx_phy_ctl1(dev, rate_fb, rate_fb_ht, bw40_fb));
 	}
 
 	/* Apply the bitfields */
@@ -898,8 +930,10 @@ bool b43_ampdu_tx_fits(struct b43_wldev *dev, struct ieee80211_tx_info *info,
 {
 	u8 mcs = info->control.rates[0].idx;
 	bool sgi = info->control.rates[0].flags & IEEE80211_TX_RC_SHORT_GI;
+	bool bw40 = b43_is_40mhz(dev) &&
+		(info->control.rates[0].flags & IEEE80211_TX_RC_40_MHZ_WIDTH);
 
-	return 3 * (b43_ht20_periods(mcs, ampdu_len, sgi) + (mcs >> 3) + 4) - 3 <= 4095;
+	return 3 * (b43_ht_periods(mcs, bw40, ampdu_len, sgi) + (mcs >> 3) + 4) - 3 <= 4095;
 }
 
 /* Minimum bytes from one MPDU start to the next for the peer's density
@@ -911,11 +945,13 @@ unsigned int b43_ampdu_tx_spacing(struct b43_wldev *dev,
 	/* Bits per 0.1 us: short GI symbols last 3.6 us instead of 4 us. */
 	unsigned int period = info->control.rates[0].flags &
 			      IEEE80211_TX_RC_SHORT_GI ? 36 : 40;
+	bool bw40 = b43_is_40mhz(dev) &&
+		(info->control.rates[0].flags & IEEE80211_TX_RC_40_MHZ_WIDTH);
 
 	if (!density)
 		return 0;
-	return DIV_ROUND_UP((1 << density) * b43_ht20_ndbps[mcs & 7] *
-			    (1 + (mcs >> 3)) * 10, 8 * 8 * period);
+	return DIV_ROUND_UP((1 << density) * b43_ht_ndbps(mcs, bw40) * 10,
+			    8 * 8 * period);
 }
 
 static s8 b43_rssi_postprocess(struct b43_wldev *dev,
@@ -1334,6 +1370,10 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 			status.band = NL80211_BAND_2GHZ;
 		status.freq =
 			ieee80211_channel_to_frequency(chanid, status.band);
+		/* The centre channel, as b43_switch_channel() gave it */
+		if ((chanstat & B43_RX_CHAN_40MHZ) && b43_is_40mhz(dev))
+			status.freq += dev->phy.chandef->chan->center_freq -
+				       dev->phy.chandef->center_freq1;
 		break;
 	default:
 		B43_WARN_ON(1);
