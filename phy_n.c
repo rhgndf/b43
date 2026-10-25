@@ -3615,10 +3615,14 @@ static void b43_nphy_tx_power_ctrl(struct b43_wldev *dev, bool enable)
 		      B43_NPHY_TXPCTL_CMD_HWPCTLEN |
 		      B43_NPHY_TXPCTL_CMD_PCTLEN))) {
 			/* We disable enabled TX pwr ctl, save it's state */
-			nphy->tx_pwr_idx[0] = b43_phy_read(dev,
-						B43_NPHY_C1_TXPCTL_STAT) & 0x7f;
-			nphy->tx_pwr_idx[1] = b43_phy_read(dev,
-						B43_NPHY_C2_TXPCTL_STAT) & 0x7f;
+			nphy->tx_pwr_idx[0] = (b43_phy_read(dev,
+						B43_NPHY_C1_TXPCTL_STAT) &
+						B43_NPHY_TXPCTL_STAT_BIDX) >>
+						B43_NPHY_TXPCTL_STAT_BIDX_SHIFT;
+			nphy->tx_pwr_idx[1] = (b43_phy_read(dev,
+						B43_NPHY_C2_TXPCTL_STAT) &
+						B43_NPHY_TXPCTL_STAT_BIDX) >>
+						B43_NPHY_TXPCTL_STAT_BIDX_SHIFT;
 		}
 
 		b43_phy_write(dev, B43_NPHY_TABLE_ADDR, 0x6840);
