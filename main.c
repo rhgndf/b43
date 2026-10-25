@@ -4409,6 +4409,7 @@ redo:
 			skb = skb_dequeue(&wl->tx_queue[queue_num]);
 			ieee80211_free_txskb(wl->hw, skb);
 		}
+		wl->tx_queue_stopped[queue_num] = false;
 	}
 
 	b43_mac_suspend(dev);
