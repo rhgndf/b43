@@ -5502,8 +5502,8 @@ static int b43_nphy_cal_tx_iq_lo(struct b43_wldev *dev,
 		last = (dev->phy.rev < 3) ? 6 : 7;
 
 		if (!mphase || nphy->mphase_cal_phase_id == last) {
-			b43_ntab_write_bulk(dev, B43_NTAB16(15, 96), 4, buffer);
-			b43_ntab_read_bulk(dev, B43_NTAB16(15, 80), 4, buffer);
+			b43_ntab_read_bulk(dev, B43_NTAB16(15, 96), 4, buffer);
+			b43_ntab_write_bulk(dev, B43_NTAB16(15, 80), 4, buffer);
 			if (dev->phy.rev < 3) {
 				buffer[0] = 0;
 				buffer[1] = 0;
