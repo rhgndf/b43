@@ -173,6 +173,10 @@ struct b43_dmadesc_generic {
 #define B43_RXRING_SLOTS		256
 #define B43_DMA0_RX_FW598_BUFSIZE	(B43_DMA0_RX_FW598_FO + IEEE80211_MAX_FRAME_LEN)
 #define B43_DMA0_RX_FW351_BUFSIZE	(B43_DMA0_RX_FW351_FO + IEEE80211_MAX_FRAME_LEN)
+/* The longest frame that DMA receives, PLCP header included: the longest
+ * MPDU. A frame longer than a buffer continues in the following ones. */
+#define B43_DMA_RX_MAX_FRAME_LEN	(sizeof(struct b43_plcp_hdr6) + \
+					 IEEE80211_MAX_MPDU_LEN_VHT_7991)
 
 /* Pointer poison */
 #define B43_DMA_PTR_POISON		((void *)ERR_PTR(-ENOMEM))
