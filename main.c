@@ -28,6 +28,7 @@
 #include <linux/workqueue.h>
 #include <linux/skbuff.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/dma-mapping.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
@@ -5185,6 +5186,43 @@ static void b43_op_sw_scan_complete_notifier(struct ieee80211_hw *hw,
 	mutex_unlock(&wl->mutex);
 }
 
+/* Whether every frame from mac80211 has got its TX status. */
+static bool b43_tx_flushed(struct b43_wl *wl)
+{
+	struct b43_wldev *dev;
+	bool flushed = true;
+	int queue_num;
+
+	mutex_lock(&wl->mutex);
+	dev = wl->current_dev;
+	if (dev && b43_status(dev) >= B43_STAT_STARTED) {
+		for (queue_num = 0; queue_num < B43_QOS_QUEUE_NUM; queue_num++) {
+			if (skb_queue_len(&wl->tx_queue[queue_num]))
+				flushed = false;
+		}
+		if (b43_using_pio_transfers(dev))
+			flushed &= b43_pio_tx_empty(dev);
+		else
+			flushed &= b43_dma_tx_empty(dev);
+	}
+	mutex_unlock(&wl->mutex);
+
+	return flushed;
+}
+
+/* Wait up to 500 ms for the queued frames, whether or not mac80211 asks to
+ * drop them. */
+static void b43_op_flush(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+			 u32 queues, bool drop)
+{
+	struct b43_wl *wl = hw_to_b43_wl(hw);
+	bool flushed;
+
+	if (poll_timeout_us(flushed = b43_tx_flushed(wl), flushed,
+			    2000, 500 * USEC_PER_MSEC, false))
+		b43dbg(wl, "TX flush timed out\n");
+}
+
 static int b43_op_get_survey(struct ieee80211_hw *hw, int idx,
 			     struct survey_info *survey)
 {
@@ -5229,6 +5267,7 @@ static const struct ieee80211_ops b43_hw_ops = {
 	.sta_notify		= b43_op_sta_notify,
 	.sw_scan_start		= b43_op_sw_scan_start_notifier,
 	.sw_scan_complete	= b43_op_sw_scan_complete_notifier,
+	.flush			= b43_op_flush,
 	.get_survey		= b43_op_get_survey,
 	.rfkill_poll		= b43_rfkill_poll,
 };

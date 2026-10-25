@@ -1754,6 +1754,16 @@ void b43_dma_tx_resume(struct b43_wldev *dev)
 	b43_power_saving_ctl_bits(dev, 0);
 }
 
+/* Whether every TX ring has got the status of all its frames. */
+bool b43_dma_tx_empty(struct b43_wldev *dev)
+{
+	return !dev->dma.tx_ring_AC_BK->used_slots &&
+	       !dev->dma.tx_ring_AC_BE->used_slots &&
+	       !dev->dma.tx_ring_AC_VI->used_slots &&
+	       !dev->dma.tx_ring_AC_VO->used_slots &&
+	       !dev->dma.tx_ring_mcast->used_slots;
+}
+
 static void direct_fifo_rx(struct b43_wldev *dev, enum b43_dmatype type,
 			   u16 mmio_base, bool enable)
 {

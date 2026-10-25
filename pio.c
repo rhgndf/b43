@@ -819,3 +819,18 @@ void b43_pio_tx_resume(struct b43_wldev *dev)
 	b43_pio_tx_resume_queue(dev->pio.tx_queue_AC_BK);
 	b43_power_saving_ctl_bits(dev, 0);
 }
+
+static bool b43_pio_txqueue_empty(struct b43_pio_txqueue *q)
+{
+	return q->free_packet_slots == B43_PIO_MAX_NR_TXPACKETS;
+}
+
+/* Whether every TX queue has got the status of all its frames. */
+bool b43_pio_tx_empty(struct b43_wldev *dev)
+{
+	return b43_pio_txqueue_empty(dev->pio.tx_queue_AC_BK) &&
+	       b43_pio_txqueue_empty(dev->pio.tx_queue_AC_BE) &&
+	       b43_pio_txqueue_empty(dev->pio.tx_queue_AC_VI) &&
+	       b43_pio_txqueue_empty(dev->pio.tx_queue_AC_VO) &&
+	       b43_pio_txqueue_empty(dev->pio.tx_queue_mcast);
+}

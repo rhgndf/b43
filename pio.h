@@ -162,5 +162,6 @@ void b43_pio_rx(struct b43_pio_rxqueue *q);
 
 void b43_pio_tx_suspend(struct b43_wldev *dev);
 void b43_pio_tx_resume(struct b43_wldev *dev);
+bool b43_pio_tx_empty(struct b43_wldev *dev);
 
 #endif /* B43_PIO_H_ */
