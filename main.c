@@ -2075,6 +2075,12 @@ static void b43_do_interrupt_thread(struct b43_wldev *dev)
 		}
 	}
 
+	if (unlikely(reason & B43_IRQ_TIMER0)) {
+		b43err(dev->wl, "PSM microcode watchdog fired\n");
+		b43_controller_restart(dev, "PSM watchdog");
+		return;
+	}
+
 	if (unlikely(merged_dma_reason & (B43_DMAIRQ_FATALMASK))) {
 		b43err(dev->wl,
 			"Fatal DMA error: 0x%08X, 0x%08X, 0x%08X, 0x%08X, 0x%08X, 0x%08X\n",
@@ -4960,6 +4966,9 @@ static void setup_struct_wldev_for_init(struct b43_wldev *dev)
 	dev->irq_mask = B43_IRQ_MASKTEMPLATE;
 	if (b43_modparam_verbose < B43_VERBOSITY_DEBUG)
 		dev->irq_mask &= ~B43_IRQ_PHY_TXERR;
+	/* brcmsmac's MI_GP0: the PSM microcode watchdog. */
+	if (dev->ht)
+		dev->irq_mask |= B43_IRQ_TIMER0;
 
 	dev->mac_suspended = 1;
 
