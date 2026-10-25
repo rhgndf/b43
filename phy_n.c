@@ -5996,9 +5996,13 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 	return B43_TXPWR_RES_DONE;
 }
 
-/* PHY state that a calibration saves on entry and restores on leaving */
-#define B43_NPHY_CAL_SAMPLES 160
+/* Play 8 us of calibration samples at the PHY's bandwidth. */
+static unsigned int b43_nphy_cal_samples(struct b43_wldev *dev)
+{
+	return b43_is_40mhz(dev) ? 320 : 160;
+}
 
+/* PHY state that a calibration saves on entry and restores on leaving */
 struct b43_nphy_cal_engine {
 	u32 clock_ctl;
 	u32 bb_mult_save;
@@ -6163,7 +6167,7 @@ static int b43_nphy_cal_engine_start(struct b43_wldev *dev,
 		return -EINVAL;
 	mode = b43_phy_read(dev, B43_NPHY_RFSEQMODE);
 	e->sample_owned = true;
-	b43_phy_write(dev, B43_NPHY_SAMP_DEPCNT, B43_NPHY_CAL_SAMPLES - 1);
+	b43_phy_write(dev, B43_NPHY_SAMP_DEPCNT, b43_nphy_cal_samples(dev) - 1);
 	b43_phy_write(dev, B43_NPHY_SAMP_LOOPCNT, 0xffff);
 	b43_phy_write(dev, B43_NPHY_SAMP_WAITCNT, 0);
 	b43_phy_write(dev, B43_NPHY_RFSEQMODE, mode | B43_NPHY_RFSEQMODE_CAOVER);
@@ -6345,11 +6349,14 @@ static int b43_nphy_cal_tx(struct b43_wldev *dev,
 	b43_nphy_tx_cal_phy_setup(dev);
 	b43_ntab_write_bulk(dev, B43_NTAB16(15, 0), 18, tbl_tx_iqlo_cal_loft_ladder_20);
 	b43_ntab_write_bulk(dev, B43_NTAB16(15, 32), 18, tbl_tx_iqlo_cal_iqimb_ladder_20);
-	err = b43_nphy_cal_engine_load_wave(dev, engine, 2500, 250);
+	/* 2.5 MHz tone at 20 MHz, 5 MHz tone at 40 MHz */
+	err = b43_nphy_cal_engine_load_wave(dev, engine,
+					    b43_is_40mhz(dev) ? 5000 : 2500, 250);
 	if (err)
 		return err;
 	b43_phy_write(dev, B43_NPHY_IQLOCAL_CMDGCTL, 0x8ad9);
-	b43_nphy_run_samples(dev, B43_NPHY_CAL_SAMPLES, 0xffff, 0, true, false, false);
+	b43_nphy_run_samples(dev, b43_nphy_cal_samples(dev), 0xffff, 0, true,
+			     false, false);
 	err = read_poll_timeout_atomic(b43_phy_read, status,
 				       (status & 3) == 2 || (status & 1),
 				       10, 10000, false, dev, B43_NPHY_SAMP_STAT);
@@ -6531,6 +6538,12 @@ static bool b43_nphy_papd_saturated(u32 value)
 	return real == 4095 || real == -4096 || imag == 4095 || imag == -4096;
 }
 
+/* PAPD calibration replaces the TX filter of the current bandwidth. */
+static u16 b43_nphy_papd_filter_reg(struct b43_wldev *dev)
+{
+	return b43_is_40mhz(dev) ? 0x195 : 0x186;
+}
+
 static void b43_nphy_papd_snapshot(struct b43_wldev *dev,
 				    struct b43_nphy_papd_cal *cal)
 {
@@ -6545,7 +6558,7 @@ static void b43_nphy_papd_snapshot(struct b43_wldev *dev,
 	for (i = 0; i < ARRAY_SIZE(cal->radio); i++)
 		cal->radio[i] = b43_radio_read(dev, b43_nphy_papd_radio[i]);
 	for (i = 0; i < ARRAY_SIZE(cal->filters); i++)
-		cal->filters[i] = b43_phy_read(dev, 0x186 + i);
+		cal->filters[i] = b43_phy_read(dev, b43_nphy_papd_filter_reg(dev) + i);
 	b43_ntab_read_bulk(dev, B43_NTAB16(7, 0x110), 2, cal->gains);
 	for (i = 0; i < 2; i++)
 		cal->bbmult[i] = b43_ntab_read(dev, B43_NTAB16(15, 87 + 8 * i));
@@ -6811,7 +6824,9 @@ static int b43_nphy_cal_papd(struct b43_wldev *dev,
 				    ARRAY_SIZE(b43_nphy_papd_scalar), b43_nphy_papd_scalar);
 	}
 	for (i = 0; i < ARRAY_SIZE(cal->filters); i++)
-		b43_phy_write(dev, 0x186 + i, (u16)tbl_tx_filter_coef_rev4[3][i] & 0x0fff);
+		b43_phy_write(dev, b43_nphy_papd_filter_reg(dev) + i,
+			      (u16)tbl_tx_filter_coef_rev4[b43_is_40mhz(dev) ? 4 : 3][i] &
+			      0x0fff);
 	for (core = 0; core < 2; core++) {
 		err = b43_nphy_papd_core(dev, engine, cal, delta, core);
 		if (err)
@@ -6826,7 +6841,7 @@ static int b43_nphy_cal_papd(struct b43_wldev *dev,
 	for (core = 0; core < 2; core++)
 		b43_phy_mask(dev, 0x297 + 4 * core, (u16)~1);
 	for (i = 0; i < ARRAY_SIZE(cal->filters); i++)
-		b43_phy_write(dev, 0x186 + i, cal->filters[i]);
+		b43_phy_write(dev, b43_nphy_papd_filter_reg(dev) + i, cal->filters[i]);
 	for (i = 0; i < ARRAY_SIZE(cal->controls); i++)
 		b43_phy_write(dev, b43_nphy_papd_controls[i], cal->controls[i]);
 	cal->scratch_restored = true;
@@ -7306,7 +7321,9 @@ static int b43_nphy_cal_rx(struct b43_wldev *dev,
 	}
 	b43_nphy_rx_iq_coeffs(dev, false, &cal->entry);
 	cal->entry_saved = true;
-	err = b43_nphy_cal_engine_load_wave(dev, engine, 2000, 250);
+	/* 2 MHz tone at 20 MHz, 4 MHz tone at 40 MHz */
+	err = b43_nphy_cal_engine_load_wave(dev, engine,
+					    b43_is_40mhz(dev) ? 4000 : 2000, 250);
 	if (err)
 		goto out;
 	for (core = 0; core < 2; core++) {
@@ -7445,7 +7462,8 @@ static bool b43_nphy_cal_qualified(struct b43_wldev *dev)
 {
 	return b43_nphy_2057_rev9_2g(dev) && dev->phy.n->ipa2g_on &&
 		dev->phy.chandef && (dev->phy.chandef->width == NL80211_CHAN_WIDTH_20 ||
-				     dev->phy.chandef->width == NL80211_CHAN_WIDTH_20_NOHT);
+				     dev->phy.chandef->width == NL80211_CHAN_WIDTH_20_NOHT ||
+				     dev->phy.chandef->width == NL80211_CHAN_WIDTH_40);
 }
 
 /* Runs in the core initialization, before DMA and interrupts are on. */
@@ -8334,8 +8352,13 @@ static int b43_nphy_op_switch_channel(struct b43_wldev *dev,
 
 static void b43_nphy_op_calibrate(struct b43_wldev *dev)
 {
+	struct b43_chanspec *cal = &dev->phy.n->txiqlocal_chanspec;
+	bool cal40 = cal->channel_type == NL80211_CHAN_HT40MINUS ||
+		     cal->channel_type == NL80211_CHAN_HT40PLUS;
+
 	if (b43_nphy_cal_runnable(dev) &&
-	    dev->phy.n->txiqlocal_chanspec.center_freq != dev->phy.chandef->chan->center_freq)
+	    (cal->center_freq != dev->phy.chandef->chan->center_freq ||
+	     cal40 != b43_is_40mhz(dev)))
 		b43_nphy_recalibrate(dev, B43_NPHY_CAL_ALL);
 }
 
