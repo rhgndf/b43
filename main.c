@@ -4075,6 +4075,9 @@ static int b43_op_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 		b43_switch_channel(dev, phy->channel);
 		if (phy->ops->calibrate)
 			phy->ops->calibrate(dev);
+		/* The TX power limits depend on the channel. */
+		b43_phy_txpower_check(dev, B43_TXPWR_IGNORE_TIME |
+					   B43_TXPWR_IGNORE_TSSI);
 	}
 
 	if (changed & IEEE80211_CONF_CHANGE_RETRY_LIMITS)

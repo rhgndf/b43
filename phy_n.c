@@ -5893,6 +5893,40 @@ static void b43_nphy_set_rx_core_state(struct b43_wldev *dev, u8 mask)
 	b43_mac_enable(dev);
 }
 
+/* TX power limits of radio 2057 rev 9 before the 1.5 dB backoff: CCK 15.5
+ * dBm, OFDM 16 dBm and every 40 MHz rate 11.5 dBm; on channels 12 and 13,
+ * CCK 11.5 dBm, OFDM 11 dBm and two-chain rates 9.5 dBm. */
+static void b43_nphy_2057_rev9_limit_txpower(struct b43_wldev *dev,
+					     struct b43_ppr *ppr)
+{
+	struct b43_ppr_rates *r = &ppr->rates;
+	int ch = dev->wl->hw->conf.chandef.chan->hw_value;
+	bool edge = ch == 12 || ch == 13;
+	u8 cck = edge ? 46 : 62;
+	u8 ofdm = edge ? 44 : 64;
+	u8 mimo = edge ? 38 : 52;
+	u8 ht40 = min_t(u8, mimo, 46);
+	int i;
+
+	for (i = 0; i < B43_PPR_CCK_RATES_NUM; i++)
+		r->cck[i] = min(r->cck[i], cck);
+	for (i = 0; i < B43_PPR_MCS_RATES_NUM; i++) {
+		r->ofdm[i] = min(r->ofdm[i], ofdm);
+		r->ofdm_20_cdd[i] = min(r->ofdm_20_cdd[i], ofdm);
+		r->mcs_20[i] = min(r->mcs_20[i], ofdm);
+		r->mcs_20_cdd[i] = min(r->mcs_20_cdd[i], mimo);
+		r->mcs_20_stbc[i] = min(r->mcs_20_stbc[i], mimo);
+		r->mcs_20_sdm[i] = min(r->mcs_20_sdm[i], mimo);
+		r->ofdm_40[i] = min(r->ofdm_40[i], ht40);
+		r->ofdm_40_cdd[i] = min(r->ofdm_40_cdd[i], ht40);
+		r->mcs_40[i] = min(r->mcs_40[i], ht40);
+		r->mcs_40_cdd[i] = min(r->mcs_40_cdd[i], ht40);
+		r->mcs_40_stbc[i] = min(r->mcs_40_stbc[i], ht40);
+		r->mcs_40_sdm[i] = min(r->mcs_40_sdm[i], ht40);
+	}
+	r->mcs_32 = min(r->mcs_32, ht40);
+}
+
 static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 							bool ignore_tssi)
 {
@@ -5941,6 +5975,8 @@ static enum b43_txpwr_result b43_nphy_op_recalc_txpower(struct b43_wldev *dev,
 							 INT_TO_Q52(13));
 		}
 		ppr->rates.mcs_32 = min_t(u8, ppr->rates.mcs_32, INT_TO_Q52(13));
+		if (b43_nphy_2057_rev9_2g(dev))
+			b43_nphy_2057_rev9_limit_txpower(dev, ppr);
 		b43_ppr_add(dev, ppr, -6);
 	}
 
