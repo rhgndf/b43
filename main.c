@@ -1688,7 +1688,7 @@ static void b43_write_template_common(struct b43_wldev *dev,
 
 	plcp.data = 0;
 	b43_generate_plcp_hdr(&plcp, size + FCS_LEN, rate, false, false,
-			      false, false);
+			      false, false, false);
 	b43_ram_write(dev, ram_offset, le32_to_cpu(plcp.data));
 	ram_offset += sizeof(u32);
 	/* The PLCP is 6 bytes long, but we only wrote 4 bytes, yet.
@@ -6113,6 +6113,13 @@ static void b43_ht_set_chains(struct b43_wldev *dev)
 		ht->mcs.tx_params |= IEEE80211_HT_MCS_TX_RX_DIFF |
 				     (tx_streams - 1) <<
 				     IEEE80211_HT_MCS_TX_MAX_STREAMS_SHIFT;
+	/* STBC sends one stream on both cores. Without this, mac80211 also
+	 * hides the peer's RX STBC from rate control.
+	 */
+	if (tx_streams > 1)
+		ht->cap |= IEEE80211_HT_CAP_TX_STBC;
+	else
+		ht->cap &= ~IEEE80211_HT_CAP_TX_STBC;
 }
 
 /* mac80211 allows this only while the device is stopped. */
