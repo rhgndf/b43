@@ -530,13 +530,14 @@ static u16 b43_nphy_classifier(struct b43_wldev *dev, u16 mask, u16 val)
 static void b43_nphy_reset_cca(struct b43_wldev *dev)
 {
 	u16 bbcfg;
+	bool forced_clock;
 
-	b43_phy_force_clock(dev, 1);
+	forced_clock = b43_phy_force_clock(dev, 1);
 	bbcfg = b43_phy_read(dev, B43_NPHY_BBCFG);
 	b43_phy_write(dev, B43_NPHY_BBCFG, bbcfg | B43_NPHY_BBCFG_RSTCCA);
 	udelay(1);
 	b43_phy_write(dev, B43_NPHY_BBCFG, bbcfg & ~B43_NPHY_BBCFG_RSTCCA);
-	b43_phy_force_clock(dev, 0);
+	b43_phy_force_clock(dev, forced_clock);
 	b43_nphy_force_rf_sequence(dev, B43_RFSEQ_RESET2RX);
 }
 
@@ -5990,6 +5991,7 @@ static int b43_phy_initn(struct b43_wldev *dev)
 	struct nphy_txgains target;
 	u16 tmp;
 	bool do_rssi_cal;
+	bool forced_clock;
 
 	u16 clip[2];
 	bool do_cal = false;
@@ -6097,11 +6099,11 @@ static int b43_phy_initn(struct b43_wldev *dev)
 	b43_nphy_workarounds(dev);
 
 	/* Reset CCA, in init code it differs a little from standard way */
-	b43_phy_force_clock(dev, 1);
+	forced_clock = b43_phy_force_clock(dev, 1);
 	tmp = b43_phy_read(dev, B43_NPHY_BBCFG);
 	b43_phy_write(dev, B43_NPHY_BBCFG, tmp | B43_NPHY_BBCFG_RSTCCA);
 	b43_phy_write(dev, B43_NPHY_BBCFG, tmp & ~B43_NPHY_BBCFG_RSTCCA);
-	b43_phy_force_clock(dev, 0);
+	b43_phy_force_clock(dev, forced_clock);
 
 	b43_mac_phy_clock_set(dev, true);
 

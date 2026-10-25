@@ -560,9 +560,10 @@ bool b43_is_40mhz(struct b43_wldev *dev)
 }
 
 /* https://bcm-v4.sipsolutions.net/802.11/PHY/N/BmacPhyClkFgc */
-void b43_phy_force_clock(struct b43_wldev *dev, bool force)
+bool b43_phy_force_clock(struct b43_wldev *dev, bool force)
 {
 	u32 tmp;
+	bool was_forced = false;
 
 	WARN_ON(dev->phy.type != B43_PHYTYPE_N &&
 		dev->phy.type != B43_PHYTYPE_HT &&
@@ -572,6 +573,7 @@ void b43_phy_force_clock(struct b43_wldev *dev, bool force)
 #ifdef CONFIG_B43_BCMA
 	case B43_BUS_BCMA:
 		tmp = bcma_aread32(dev->dev->bdev, BCMA_IOCTL);
+		was_forced = !!(tmp & BCMA_IOCTL_FGC);
 		if (force)
 			tmp |= BCMA_IOCTL_FGC;
 		else
@@ -582,6 +584,7 @@ void b43_phy_force_clock(struct b43_wldev *dev, bool force)
 #ifdef CONFIG_B43_SSB
 	case B43_BUS_SSB:
 		tmp = ssb_read32(dev->dev->sdev, SSB_TMSLOW);
+		was_forced = !!(tmp & SSB_TMSLOW_FGC);
 		if (force)
 			tmp |= SSB_TMSLOW_FGC;
 		else
@@ -590,4 +593,6 @@ void b43_phy_force_clock(struct b43_wldev *dev, bool force)
 		break;
 #endif
 	}
+
+	return was_forced;
 }
