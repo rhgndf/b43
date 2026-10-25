@@ -906,6 +906,12 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 		chanstat = le16_to_cpu(rxhdr->format_351.channel);
 		break;
 	}
+	/* brcmsmac treats frame type 3 as an error, and the BCM43227 was
+	 * not seen to report it.
+	 */
+	if (dev->ht &&
+	    (phystat0 & B43_RX_PHYST0_FTYPE) == B43_RX_PHYST0_STD_N)
+		goto drop;
 
 	if (unlikely(macstat & B43_RX_MAC_FCSERR)) {
 		dev->wl->ieee_stats.dot11FCSErrorCount++;
@@ -987,7 +993,26 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
 		break;
 	}
 
-	if (phystat0 & B43_RX_PHYST0_OFDM)
+	if (dev->ht && (phystat0 & B43_RX_PHYST0_PRE_N)) {
+		/* Type 2 is HT on N-PHY, not a legacy CCK rate code. A
+		 * failed HT-SIG cannot provide trustworthy MCS metadata. */
+		if (dev->fw.hdr_format != B43_FW_HDR_598 ||
+		    (status.flag & RX_FLAG_FAILED_PLCP_CRC))
+			goto drop;
+		rate_idx = plcp->raw[0] & 0x7f;
+		if (rate_idx > 15)
+			goto drop;
+		status.encoding = RX_ENC_HT;
+		status.enc_flags &= ~RX_ENC_FLAG_SHORTPRE;
+		status.bw = (plcp->raw[0] & 0x80) ?
+			RATE_INFO_BW_40 : RATE_INFO_BW_20;
+		if (plcp->raw[3] & 0x80)
+			status.enc_flags |= RX_ENC_FLAG_SHORT_GI;
+		if (plcp->raw[3] & 0x40)
+			status.enc_flags |= RX_ENC_FLAG_LDPC;
+		status.enc_flags |= ((plcp->raw[3] >> 4) & 3) <<
+				    RX_ENC_FLAG_STBC_SHIFT;
+	} else if (phystat0 & B43_RX_PHYST0_OFDM)
 		rate_idx = b43_plcp_get_bitrate_idx_ofdm(plcp,
 					!!(chanstat & B43_RX_CHAN_5GHZ));
 	else
